@@ -57,6 +57,8 @@ function fake(
     setupEffect?: (command: string) => Promise<void> | void;
     /** Holds every stream (re)start until it resolves. */
     streamGate?: () => Promise<void>;
+    /** Thrown from connect, e.g. an AGS resume probe timeout. */
+    connectError?: (id: string) => Error | undefined;
   } = {},
 ) {
   const boxes = new Map<string, DesktopInfo>();
@@ -67,6 +69,7 @@ function fake(
     infos: 0,
     create: [] as { template: string; metadata: Record<string, string> }[],
     pause: [] as string[],
+    kill: [] as string[],
     connect: [] as { id: string; timeoutMs: number }[],
     keepAlive: [] as number[],
     run: [] as { command: string; options: DesktopRunOptions }[],
@@ -189,8 +192,15 @@ function fake(
       (boxes.get(id) as DesktopInfo).state = "paused";
       desktops.set(id, false);
     },
+    async kill(id) {
+      calls.kill.push(id);
+      boxes.delete(id);
+      desktops.delete(id);
+    },
     async connect(id, timeoutMs) {
       calls.connect.push({ id, timeoutMs });
+      const error = options.connectError?.(id);
+      if (error) throw error;
       // Sandbox.connect resumes a paused box.
       (boxes.get(id) as DesktopInfo).state = "running";
       (boxes.get(id) as DesktopInfo).endAt = new Date(Date.now() + timeoutMs);
@@ -1332,6 +1342,7 @@ test("ownership labels are a subset of sandbox metadata", async () => {
       throw new Error("create");
     },
     async pause() {},
+    async kill() {},
     async connect() {
       throw new Error("connect");
     },
@@ -1511,4 +1522,84 @@ test("a custom cluster session accepts a running Xvfb without xfce", {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("a custom cluster omits stdin unless the command needs it", async () => {
+  const seen: { stdin?: boolean }[] = [];
+  class Sandbox {
+    commands = {
+      run: async (_command: string, opts: { stdin?: boolean }) => {
+        seen.push(opts);
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    };
+    static async connect() {
+      return new Sandbox();
+    }
+  }
+  const load = async () =>
+    ({ Sandbox, CommandExitError }) as unknown as Awaited<
+      ReturnType<NonNullable<Parameters<typeof e2bDesktopDriver>[1]>>
+    >;
+  const runOpts = {
+    user: "user",
+    cwd: "/workspace",
+    envs: { DISPLAY: ":0" },
+    timeoutMs: 1_000,
+    onStdout: () => {},
+    onStderr: () => {},
+  };
+  const custom = await e2bDesktopDriver(
+    { ...config, e2bApiUrl: "https://api.example.test" },
+    load,
+  ).connect("sbx", 1_000);
+  await custom.run("echo hi", { ...runOpts, stdin: false });
+  assert.equal("stdin" in seen[0], false);
+  await custom.run("cat", { ...runOpts, stdin: true });
+  assert.equal(seen[1].stdin, true);
+  seen.length = 0;
+  const cloud = await e2bDesktopDriver(config, load).connect("sbx", 1_000);
+  await cloud.run("echo hi", { ...runOpts, stdin: false });
+  assert.equal(seen[0].stdin, false);
+});
+
+test("a custom cluster replaces a paused sandbox when resume fails", async () => {
+  let probes = 0;
+  const f = fake({
+    boxes: [{ state: "paused" }],
+    connectError: () => {
+      probes++;
+      return probes === 1
+        ? new Error("400: [FailedOperation.ContainerProbe] probe timeout")
+        : undefined;
+    },
+  });
+  const custom = { ...config, e2bApiUrl: "https://api.example.test", e2bDomain: "example.test" };
+  const owner = `owner-${++owners}`;
+  const ownerLabels = computerIdentity(custom, owner).labels;
+  for (const info of f.boxes.values()) info.metadata = { ...info.metadata, ...ownerLabels };
+  const computer = new ComputerService(
+    db,
+    custom,
+    undefined,
+    new E2BDesktopComputer(custom, f.driver),
+  );
+  assert.equal((await computer.start(owner)).status, "running");
+  assert.deepEqual(f.calls.kill, ["sbx-1"]);
+  assert.equal(f.calls.create.length, 1);
+  assert.equal(f.calls.connect.length, 2);
+  assert.equal(f.boxes.has("sbx-1"), true);
+  assert.equal((await computer.snapshot(owner)).status, "running");
+});
+
+test("public E2B keeps a paused sandbox when resume fails", async () => {
+  const f = fake({
+    boxes: [{ state: "paused" }],
+    connectError: () => new Error("400: [FailedOperation.ContainerProbe] probe timeout"),
+  });
+  const { computer, owner } = service(f);
+  await assert.rejects(computer.start(owner), { status: 503 });
+  assert.deepEqual(f.calls.kill, []);
+  assert.equal(f.calls.create.length, 0);
+  assert.equal(f.boxes.get("sbx-1")?.state, "paused");
 });

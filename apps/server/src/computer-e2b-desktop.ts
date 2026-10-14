@@ -77,6 +77,8 @@ export interface DesktopDriver {
   create(template: string, metadata: Record<string, string>): Promise<string>;
   /** Filesystem-only pause: every process ends and the disk persists. */
   pause(sandboxId: string): Promise<void>;
+  /** Delete the sandbox. The disk, including /workspace, is not kept. */
+  kill(sandboxId: string): Promise<void>;
   /** Connect, resuming a paused sandbox, and set its idle timeout. */
   connect(sandboxId: string, timeoutMs: number): Promise<DesktopBox>;
 }
@@ -138,6 +140,10 @@ export function e2bDesktopDriver(config: Config, load = sdk): DesktopDriver {
       // Static pause: connect() would resume a box that is already paused.
       await Sandbox.pause(sandboxId, { ...opts(), keepMemory: false });
     },
+    async kill(sandboxId) {
+      const { Sandbox } = await load();
+      await Sandbox.kill(sandboxId, opts());
+    },
     async connect(sandboxId, timeoutMs) {
       const { CommandExitError, Sandbox } = await load();
       const box = await Sandbox.connect(sandboxId, { ...opts(), timeoutMs });
@@ -160,7 +166,14 @@ export function e2bDesktopDriver(config: Config, load = sdk): DesktopDriver {
           if (!config.e2bApiUrl) return box.commands.run(command, { ...options, background: true });
           const envs = { ...options.envs };
           delete envs.DISPLAY;
-          return box.commands.run(shellCommand(command), { ...options, envs, background: true });
+          // envd before 0.3.0 rejects an explicit `stdin: false` ("it's always turned on").
+          const { stdin, ...rest } = options;
+          return box.commands.run(shellCommand(command), {
+            ...rest,
+            envs,
+            background: true,
+            ...(stdin ? { stdin: true } : {}),
+          });
         },
         setup,
         async writeRootFile(path, data) {
@@ -496,18 +509,55 @@ export class E2BDesktopComputer {
   private forget(id: string) {
     this.handles.delete(id);
   }
+  // Public E2B resumes a paused sandbox. A custom cluster (AGS) can reject that
+  // resume; drop the sandbox and create another. Its /workspace cannot be copied.
+  private async open(
+    id: string,
+    info: DesktopInfo | undefined,
+    labels: Record<string, string>,
+    paused: boolean,
+  ): Promise<{ id: string; box: DesktopBox }> {
+    const resume = Boolean(this.config.e2bApiUrl) && paused;
+    try {
+      return { id, box: await this.driver.connect(id, this.awake(info, idleMs)) };
+    } catch (error) {
+      if (!resume || error instanceof AppError) {
+        if (error instanceof AppError) throw error;
+        await this.control(() => Promise.reject(error));
+        throw error;
+      }
+      await this.control(() => this.driver.kill(id));
+      const created = await this.control(() => this.driver.create(this.template(), labels));
+      const next = await this.inspect(labels);
+      if (!next)
+        throw new AppError(
+          "E2B desktop operation failed. Check E2B_API_KEY and COMPUTER_E2B_TEMPLATE.",
+          503,
+        );
+      return {
+        id: created,
+        box: await this.control(() => this.driver.connect(created, this.awake(next, idleMs))),
+      };
+    }
+  }
   async start(labels: Record<string, string>) {
     const existing = await this.inspect(labels);
-    const id = existing
+    let id = existing
       ? existing.sandboxId
       : await this.control(() => this.driver.create(this.template(), labels));
     const info = await this.inspect(labels); // re-check before start, including the shared deadline
     if (existing?.state !== "running") this.forget(id);
-    const cached = this.handles.get(id);
-    const box =
-      cached?.box ?? (await this.control(() => this.driver.connect(id, this.awake(info, idleMs))));
-    if (cached) await this.control(() => box.keepAlive(this.awake(info, idleMs)));
-    if (!cached) this.handles.set(id, { box });
+    const cached = this.handles.get(id)?.box;
+    let box: DesktopBox;
+    if (cached) {
+      box = cached;
+      await this.control(() => box.keepAlive(this.awake(info, idleMs)));
+    } else {
+      const opened = await this.open(id, info, labels, existing?.state === "paused");
+      id = opened.id;
+      box = opened.box;
+      this.handles.set(id, { box });
+    }
     const script = await loadFilesScript();
     await this.control(async () => {
       if (
