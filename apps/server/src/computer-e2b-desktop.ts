@@ -19,6 +19,13 @@ const idleMs = 15 * 60_000; // auto-pause after 15 idle minutes; each operation 
 const desktopIdleMs = 30 * 60_000;
 const controlMs = 10_000;
 const createMs = 60_000;
+// AGS resume often outlives the 10s control-plane timeout and then rejects kill
+// until that resume operation finishes.
+export const resumeRequestMs = 180_000;
+const killRetryWaits = [0, 1_000, 2_000, 4_000, 8_000];
+const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+const operationInProgress = (error: unknown) =>
+  /OperationInProgress/i.test(error instanceof Error ? error.message : String(error));
 const user = "user"; // the desktop template's uid 1000 account
 const display = ":0";
 export const resolution: [number, number] = [1280, 800];
@@ -79,8 +86,10 @@ export interface DesktopDriver {
   pause(sandboxId: string): Promise<void>;
   /** Delete the sandbox. The disk, including /workspace, is not kept. */
   kill(sandboxId: string): Promise<void>;
-  /** Connect, resuming a paused sandbox, and set its idle timeout. */
-  connect(sandboxId: string, timeoutMs: number): Promise<DesktopBox>;
+  /** Connect, resuming a paused sandbox, and set its idle timeout.
+   * `requestTimeoutMs` bounds the control-plane call. The default is the short
+   * control timeout; a custom-cluster resume passes a longer one. */
+  connect(sandboxId: string, timeoutMs: number, requestTimeoutMs?: number): Promise<DesktopBox>;
 }
 
 // `load` is the SDK module; tests pass a fake one.
@@ -144,9 +153,12 @@ export function e2bDesktopDriver(config: Config, load = sdk): DesktopDriver {
       const { Sandbox } = await load();
       await Sandbox.kill(sandboxId, opts());
     },
-    async connect(sandboxId, timeoutMs) {
+    async connect(sandboxId, timeoutMs, requestTimeoutMs = controlMs) {
       const { CommandExitError, Sandbox } = await load();
-      const box = await Sandbox.connect(sandboxId, { ...opts(), timeoutMs });
+      const box = await Sandbox.connect(sandboxId, {
+        ...connection(requestTimeoutMs),
+        timeoutMs,
+      });
       const setup = async (command: string, asUser: string, timeoutMs = 45_000) => {
         try {
           return (
@@ -451,6 +463,7 @@ export class E2BDesktopComputer {
   constructor(
     private readonly config: Config,
     private readonly driver: DesktopDriver = e2bDesktopDriver(config),
+    private readonly sleep: (ms: number) => Promise<void> = delay,
   ) {}
   template() {
     const template = this.config.computerE2bTemplate ?? "desktop";
@@ -519,14 +532,21 @@ export class E2BDesktopComputer {
   ): Promise<{ id: string; box: DesktopBox }> {
     const resume = Boolean(this.config.e2bApiUrl) && paused;
     try {
-      return { id, box: await this.driver.connect(id, this.awake(info, idleMs)) };
+      return {
+        id,
+        box: await this.driver.connect(
+          id,
+          this.awake(info, idleMs),
+          resume ? resumeRequestMs : undefined,
+        ),
+      };
     } catch (error) {
       if (!resume || error instanceof AppError) {
         if (error instanceof AppError) throw error;
         await this.control(() => Promise.reject(error));
         throw error;
       }
-      await this.control(() => this.driver.kill(id));
+      await this.killWithRetry(id);
       const created = await this.control(() => this.driver.create(this.template(), labels));
       const next = await this.inspect(labels);
       if (!next)
@@ -539,6 +559,35 @@ export class E2BDesktopComputer {
         box: await this.control(() => this.driver.connect(created, this.awake(next, idleMs))),
       };
     }
+  }
+  // AGS returns 409 OperationInProgress while the timed-out resume is still running.
+  // Wait until getInfo shows a settled pause, and retry kill across that window.
+  private async killWithRetry(id: string) {
+    let last: unknown;
+    for (let attempt = 0; attempt < killRetryWaits.length; attempt++) {
+      if (killRetryWaits[attempt]) await this.sleep(killRetryWaits[attempt]);
+      let current: DesktopInfo | undefined;
+      try {
+        current = await this.driver.info(id);
+      } catch {
+        current = undefined;
+      }
+      const ags = current?.metadata["x-ags-sandbox-state"];
+      const busy = Boolean(ags) && ags !== "resume_failed" && ags !== "paused";
+      if (busy && attempt < killRetryWaits.length - 1) continue;
+      try {
+        await this.driver.kill(id);
+        return;
+      } catch (error) {
+        last = error;
+        if (!operationInProgress(error) || attempt === killRetryWaits.length - 1) {
+          if (error instanceof AppError) throw error;
+          await this.control(() => Promise.reject(error));
+          throw error;
+        }
+      }
+    }
+    await this.control(() => Promise.reject(last));
   }
   async start(labels: Record<string, string>) {
     const existing = await this.inspect(labels);

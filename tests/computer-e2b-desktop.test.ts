@@ -20,6 +20,7 @@ import {
   desktopInput,
   E2BDesktopComputer,
   e2bDesktopDriver,
+  resumeRequestMs,
 } from "../apps/server/src/computer-e2b-desktop.ts";
 import { computerInstructions, computerTools } from "../apps/server/src/computer-tools.ts";
 import type { Config } from "../apps/server/src/config.ts";
@@ -59,6 +60,10 @@ function fake(
     streamGate?: () => Promise<void>;
     /** Thrown from connect, e.g. an AGS resume probe timeout. */
     connectError?: (id: string) => Error | undefined;
+    /** Thrown from kill, e.g. 409 while a resume is still in progress. */
+    killError?: () => Error | undefined;
+    /** Mutates the info snapshot returned to the caller. */
+    onInfo?: (info: DesktopInfo) => void;
   } = {},
 ) {
   const boxes = new Map<string, DesktopInfo>();
@@ -70,7 +75,7 @@ function fake(
     create: [] as { template: string; metadata: Record<string, string> }[],
     pause: [] as string[],
     kill: [] as string[],
-    connect: [] as { id: string; timeoutMs: number }[],
+    connect: [] as { id: string; timeoutMs: number; requestTimeoutMs?: number }[],
     keepAlive: [] as number[],
     run: [] as { command: string; options: DesktopRunOptions }[],
     setup: [] as { command: string; user: string; timeoutMs?: number }[],
@@ -180,6 +185,7 @@ function fake(
     async info(id) {
       calls.infos++;
       const info = structuredClone(boxes.get(id) as DesktopInfo);
+      options.onInfo?.(info);
       options.afterInfo?.(id);
       return info;
     },
@@ -194,11 +200,13 @@ function fake(
     },
     async kill(id) {
       calls.kill.push(id);
+      const error = options.killError?.();
+      if (error) throw error;
       boxes.delete(id);
       desktops.delete(id);
     },
-    async connect(id, timeoutMs) {
-      calls.connect.push({ id, timeoutMs });
+    async connect(id, timeoutMs, requestTimeoutMs?: number) {
+      calls.connect.push({ id, timeoutMs, requestTimeoutMs });
       const error = options.connectError?.(id);
       if (error) throw error;
       // Sandbox.connect resumes a paused box.
@@ -1585,6 +1593,8 @@ test("a custom cluster replaces a paused sandbox when resume fails", async () =>
     new E2BDesktopComputer(custom, f.driver),
   );
   assert.equal((await computer.start(owner)).status, "running");
+  assert.equal(f.calls.connect[0].requestTimeoutMs, resumeRequestMs);
+  assert.equal(f.calls.connect[1].requestTimeoutMs, undefined);
   assert.deepEqual(f.calls.kill, ["sbx-1"]);
   assert.equal(f.calls.create.length, 1);
   assert.equal(f.calls.connect.length, 2);
@@ -1601,5 +1611,130 @@ test("public E2B keeps a paused sandbox when resume fails", async () => {
   await assert.rejects(computer.start(owner), { status: 503 });
   assert.deepEqual(f.calls.kill, []);
   assert.equal(f.calls.create.length, 0);
+  assert.equal(f.calls.connect[0].requestTimeoutMs, undefined);
   assert.equal(f.boxes.get("sbx-1")?.state, "paused");
+});
+
+test("a custom cluster retries kill while resume is still in progress", async () => {
+  let kills = 0;
+  let connects = 0;
+  const sleeps: number[] = [];
+  const f = fake({
+    boxes: [{ state: "paused" }],
+    connectError: () => {
+      connects++;
+      return connects === 1
+        ? new Error("TimeoutError: The operation was aborted due to timeout")
+        : undefined;
+    },
+    killError: () => {
+      kills++;
+      return kills < 3
+        ? new Error("409 [FailedOperation.SandboxInstanceOperationInProgress]")
+        : undefined;
+    },
+  });
+  const custom = { ...config, e2bApiUrl: "https://api.example.test", e2bDomain: "example.test" };
+  const owner = `owner-${++owners}`;
+  const ownerLabels = computerIdentity(custom, owner).labels;
+  for (const info of f.boxes.values()) info.metadata = { ...info.metadata, ...ownerLabels };
+  const computer = new ComputerService(
+    db,
+    custom,
+    undefined,
+    new E2BDesktopComputer(custom, f.driver, async (ms) => {
+      sleeps.push(ms);
+    }),
+  );
+  assert.equal((await computer.start(owner)).status, "running");
+  assert.deepEqual(sleeps, [1_000, 2_000]);
+  assert.deepEqual(f.calls.kill, ["sbx-1", "sbx-1", "sbx-1"]);
+  assert.equal(f.calls.create.length, 1);
+  assert.equal(f.calls.connect[0].requestTimeoutMs, resumeRequestMs);
+});
+
+test("a custom cluster waits for resume_failed before deleting the paused sandbox", async () => {
+  let phase = "before";
+  let connects = 0;
+  const sleeps: number[] = [];
+  const f = fake({
+    boxes: [{ state: "paused" }],
+    connectError: () => {
+      connects++;
+      if (connects > 1) return undefined;
+      phase = "resuming";
+      return new Error("400: [FailedOperation.ContainerProbe] probe timeout");
+    },
+    onInfo: (info) => {
+      if (phase === "before") return;
+      info.metadata["x-ags-sandbox-state"] = phase === "resuming" ? "resuming" : "resume_failed";
+    },
+  });
+  const custom = { ...config, e2bApiUrl: "https://api.example.test" };
+  const owner = `owner-${++owners}`;
+  const ownerLabels = computerIdentity(custom, owner).labels;
+  for (const info of f.boxes.values()) info.metadata = { ...info.metadata, ...ownerLabels };
+  const computer = new ComputerService(
+    db,
+    custom,
+    undefined,
+    new E2BDesktopComputer(custom, f.driver, async (ms) => {
+      sleeps.push(ms);
+      phase = "failed";
+    }),
+  );
+  assert.equal((await computer.start(owner)).status, "running");
+  assert.deepEqual(sleeps, [1_000]);
+  assert.deepEqual(f.calls.kill, ["sbx-1"]);
+  assert.equal(f.calls.create.length, 1);
+});
+
+test("a custom cluster does not retry a kill that is not in progress", async () => {
+  const sleeps: number[] = [];
+  const f = fake({
+    boxes: [{ state: "paused" }],
+    connectError: () => new Error("TimeoutError: The operation was aborted due to timeout"),
+    killError: () => new Error("403 forbidden"),
+  });
+  const custom = { ...config, e2bApiUrl: "https://api.example.test" };
+  const owner = `owner-${++owners}`;
+  const ownerLabels = computerIdentity(custom, owner).labels;
+  for (const info of f.boxes.values()) info.metadata = { ...info.metadata, ...ownerLabels };
+  const computer = new ComputerService(
+    db,
+    custom,
+    undefined,
+    new E2BDesktopComputer(custom, f.driver, async (ms) => {
+      sleeps.push(ms);
+    }),
+  );
+  await assert.rejects(computer.start(owner), { status: 503 });
+  assert.deepEqual(sleeps, []);
+  assert.deepEqual(f.calls.kill, ["sbx-1"]);
+  assert.equal(f.calls.create.length, 0);
+  assert.equal(f.boxes.get("sbx-1")?.state, "paused");
+});
+
+test("connect uses the short control timeout unless a resume timeout is requested", async () => {
+  const seen: { requestTimeoutMs?: number; timeoutMs?: number }[] = [];
+  class Sandbox {
+    sandboxId = "sbx";
+    static async connect(_id: string, opts: { requestTimeoutMs?: number; timeoutMs?: number }) {
+      seen.push(opts);
+      return new Sandbox();
+    }
+  }
+  const load = async () =>
+    ({ Sandbox, CommandExitError }) as unknown as Awaited<
+      ReturnType<NonNullable<Parameters<typeof e2bDesktopDriver>[1]>>
+    >;
+  const custom = e2bDesktopDriver({ ...config, e2bApiUrl: "https://api.example.test" }, load);
+  await custom.connect("sbx", 1_000);
+  await custom.connect("sbx", 1_000, resumeRequestMs);
+  const cloud = e2bDesktopDriver(config, load);
+  await cloud.connect("sbx", 1_000);
+  assert.equal(seen[0].requestTimeoutMs, 10_000);
+  assert.equal(seen[1].requestTimeoutMs, resumeRequestMs);
+  assert.equal(seen[2].requestTimeoutMs, 10_000);
+  assert.equal(seen[0].timeoutMs, 1_000);
 });
