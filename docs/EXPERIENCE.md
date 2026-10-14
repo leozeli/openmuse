@@ -9,7 +9,7 @@ OpenMuse keeps conversation, ongoing work, and user control together in a shared
 - Follow-ups appear in a visible queue and run in order. Stopping a reply pauses that queue; it does not cancel delegated tasks. A new submission can continue immediately when no follow-ups are held. An existing paused queue resumes through **Send queued messages**.
 - Open chats and their drafts remain mounted while navigating. Queued messages are held in the open app, not a server inbox; keep the app open until they are sent. Delegated tasks are durable server work.
 - Reading older messages should not force a scroll to the latest reply. A latest-message control returns to the live conversation.
-- **Download Markdown** saves the open chat as a `.md` file. The conversation menu downloads a saved main chat or side chat the same way.
+- **Download Markdown** on the open chat saves that chat as a `.md` file. In the conversation menu, **Export conversation…** lists saved chats so you can download a main chat or side chat without opening it. Each saved chat row has the same action.
 
 ## Transparency and control
 
