@@ -45,10 +45,15 @@ COMPUTER_PROVIDER=e2b-desktop
 E2B_API_KEY=e2b_...            # API and task worker only; never passed into the sandbox
 COMPUTER_DEPLOYMENT_ID=...     # required and unique per install, e.g. `openssl rand -hex 12`
 # COMPUTER_E2B_TEMPLATE=desktop  # default; or a custom template built from it
-# E2B_DOMAIN=...                 # only for a non-default E2B cluster
+# Leave both unset for public E2B. E2B_API_URL is the control plane;
+# E2B_DOMAIN is the data plane used for the desktop stream host.
+# Tencent AGS (ap-guangzhou), with your own key and template id:
+# E2B_API_URL=https://api.ap-guangzhou.tencentags.com
+# E2B_DOMAIN=ap-guangzhou.tencentags.com
+# COMPUTER_E2B_TEMPLATE=sdt-your-template
 ```
 
-`config.ts` never lets `.env` override a variable that is already set, so unset any `E2B_API_KEY`, `E2B_DOMAIN` or `E2B_API_URL` exported in your shell for another cluster before `pnpm dev`.
+`config.ts` never lets `.env` override a variable that is already set, so unset any `E2B_API_KEY`, `E2B_DOMAIN` or `E2B_API_URL` exported in your shell for another cluster before `pnpm dev`. The desktop driver passes `apiUrl` and `domain` into the E2B SDK only when those variables are set. On a custom cluster the stream host is `E2B_DOMAIN` rather than `e2b.app`.
 
 Open **Computer → Start computer**. A **Desktop** tab appears next to Browser, Terminal and Files while the computer runs. On web it embeds the live stream; on iOS and Android, **Open desktop** opens it in the system browser. The stream URL is returned only to the signed-in owner. Treat it as a bearer secret: anyone holding it gets full keyboard and mouse control until the next Stop. It carries a VNC password, and VNC authentication uses only its first 8 characters.
 

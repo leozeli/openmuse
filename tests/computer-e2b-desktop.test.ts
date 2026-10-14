@@ -1239,3 +1239,69 @@ test("desktop command cannot bypass an interrupted receipt after lease validatio
     db.get = originalGet;
   }
 });
+
+test("E2B SDK calls include apiUrl and domain only when the cluster is configured", async () => {
+  const seen: { method: string; opts: Record<string, unknown> }[] = [];
+  class Sandbox {
+    sandboxId = "sbx-custom";
+    static list(opts: Record<string, unknown>) {
+      seen.push({ method: "list", opts });
+      return {
+        async nextItems() {
+          return [{ sandboxId: "sbx-custom" }];
+        },
+      };
+    }
+    static async getInfo(_id: string, opts: Record<string, unknown>) {
+      seen.push({ method: "getInfo", opts });
+      return {
+        sandboxId: "sbx-custom",
+        templateId: "tpl",
+        state: "paused",
+        endAt: new Date(),
+        metadata: {},
+      };
+    }
+    static async create(_template: string, opts: Record<string, unknown>) {
+      seen.push({ method: "create", opts });
+      return new Sandbox();
+    }
+    static async pause(_id: string, opts: Record<string, unknown>) {
+      seen.push({ method: "pause", opts });
+    }
+    static async connect(_id: string, opts: Record<string, unknown>) {
+      seen.push({ method: "connect", opts });
+      return new Sandbox();
+    }
+  }
+  const load = async () =>
+    ({ Sandbox, CommandExitError }) as unknown as Awaited<
+      ReturnType<NonNullable<Parameters<typeof e2bDesktopDriver>[1]>>
+    >;
+  const custom = e2bDesktopDriver(
+    { ...config, e2bApiUrl: "https://api.example.test", e2bDomain: "example.test" },
+    load,
+  );
+  assert.deepEqual(await custom.list({ owner: "a" }), ["sbx-custom"]);
+  await custom.info("sbx-custom");
+  assert.equal(await custom.create("sdt-your-template", { owner: "a" }), "sbx-custom");
+  await custom.pause("sbx-custom");
+  await custom.connect("sbx-custom", 1_000);
+  assert.deepEqual(
+    seen.map((call) => call.method),
+    ["list", "getInfo", "create", "pause", "connect"],
+  );
+  for (const call of seen) {
+    assert.equal(call.opts.apiKey, apiKey);
+    assert.equal(call.opts.apiUrl, "https://api.example.test");
+    assert.equal(call.opts.domain, "example.test");
+  }
+  assert.equal(seen.find((call) => call.method === "create")?.opts.requestTimeoutMs, 60_000);
+  seen.length = 0;
+  const cloud = e2bDesktopDriver(config, load);
+  await cloud.create("desktop", {});
+  const created = seen[0]?.opts;
+  assert.equal(created?.apiKey, apiKey);
+  assert.equal("apiUrl" in (created ?? {}), false);
+  assert.equal("domain" in (created ?? {}), false);
+});

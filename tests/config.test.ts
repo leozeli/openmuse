@@ -118,11 +118,13 @@ test("computer provider defaults to Docker and e2b-desktop requires a server-sid
     "COMPUTER_E2B_TEMPLATE",
     "COMPUTER_DEPLOYMENT_ID",
     "CPK_INTELLIGENCE_API_KEY",
+    "E2B_API_URL",
+    "E2B_DOMAIN",
   ];
   const old = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
   try {
     process.env.CPK_INTELLIGENCE_API_KEY = "test-project-key-never-sent";
-    for (const key of keys.slice(0, 5)) delete process.env[key];
+    for (const key of keys) if (key !== "CPK_INTELLIGENCE_API_KEY") delete process.env[key];
     assert.equal(readConfig().computerProvider, "docker");
     process.env.COMPUTER_PROVIDER = "k8s";
     assert.throws(() => readConfig(), /COMPUTER_PROVIDER/);
@@ -138,6 +140,17 @@ test("computer provider defaults to Docker and e2b-desktop requires a server-sid
     assert.equal(config.computerProvider, "e2b-desktop");
     assert.equal(config.computerE2bTemplate, "desktop");
     assert.equal(config.e2bApiKey, "fixture-key");
+    assert.equal(config.e2bApiUrl, undefined);
+    assert.equal(config.e2bDomain, undefined);
+    process.env.E2B_API_URL = " ";
+    process.env.E2B_DOMAIN = " \t";
+    assert.equal(readConfig().e2bApiUrl, undefined);
+    assert.equal(readConfig().e2bDomain, undefined);
+    process.env.E2B_API_URL = " https://api.example.test ";
+    process.env.E2B_DOMAIN = " example.test ";
+    const custom = readConfig();
+    assert.equal(custom.e2bApiUrl, "https://api.example.test");
+    assert.equal(custom.e2bDomain, "example.test");
   } finally {
     for (const [key, value] of Object.entries(old)) {
       if (value === undefined) delete process.env[key];

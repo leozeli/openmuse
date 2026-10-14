@@ -81,7 +81,14 @@ export interface DesktopDriver {
 
 // `load` is the SDK module; tests pass a fake one.
 export function e2bDesktopDriver(config: Config, load = sdk): DesktopDriver {
-  const opts = () => ({ apiKey: config.e2bApiKey, requestTimeoutMs: controlMs });
+  // Omit unset endpoint fields so the SDK keeps its public E2B defaults.
+  const connection = (requestTimeoutMs: number) => ({
+    apiKey: config.e2bApiKey,
+    requestTimeoutMs,
+    ...(config.e2bApiUrl ? { apiUrl: config.e2bApiUrl } : {}),
+    ...(config.e2bDomain ? { domain: config.e2bDomain } : {}),
+  });
+  const opts = () => connection(controlMs);
   return {
     async list(metadata) {
       const { Sandbox } = await load();
@@ -99,8 +106,7 @@ export function e2bDesktopDriver(config: Config, load = sdk): DesktopDriver {
     async create(template, metadata) {
       const { Sandbox } = await load();
       const box = await Sandbox.create(template, {
-        ...opts(),
-        requestTimeoutMs: createMs,
+        ...connection(createMs),
         metadata,
         timeoutMs: idleMs,
         resolution,
