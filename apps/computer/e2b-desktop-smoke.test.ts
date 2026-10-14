@@ -14,6 +14,13 @@ import { createStore } from "../server/src/db.ts";
 // Explicit opt-in script against real E2B: a unique deployment, and every sandbox it
 // creates is killed afterwards. Run: E2B_API_KEY=... pnpm test:computer:e2b-desktop
 const apiKey = process.env.E2B_API_KEY?.trim();
+const e2bApiUrl = process.env.E2B_API_URL?.trim() || undefined;
+const e2bDomain = process.env.E2B_DOMAIN?.trim() || undefined;
+const connection = {
+  apiKey,
+  ...(e2bApiUrl ? { apiUrl: e2bApiUrl } : {}),
+  ...(e2bDomain ? { domain: e2bDomain } : {}),
+};
 test("real E2B desktop runs commands, opens GUI apps, streams, acts, persists files and stops active work", {
   timeout: 300000,
   skip: !apiKey && "set E2B_API_KEY to run the E2B desktop smoke test",
@@ -34,6 +41,8 @@ test("real E2B desktop runs commands, opens GUI apps, streams, acts, persists fi
     computerProvider: "e2b-desktop",
     computerE2bTemplate: process.env.COMPUTER_E2B_TEMPLATE ?? "desktop",
     e2bApiKey: apiKey,
+    e2bApiUrl,
+    e2bDomain,
     computerDeploymentId: `smoke-${randomUUID()}`,
   };
   const server = await createApp(db, config);
@@ -42,7 +51,7 @@ test("real E2B desktop runs commands, opens GUI apps, streams, acts, persists fi
   const sandboxIds = async () =>
     (
       await Sandbox.list({
-        apiKey,
+        ...connection,
         query: { metadata: labels, state: ["running", "paused"] },
       }).nextItems()
     ).map((item) => item.sandboxId);
@@ -197,7 +206,7 @@ test("real E2B desktop runs commands, opens GUI apps, streams, acts, persists fi
       command: "printf ready > /workspace/.smoke-running; sleep 30",
     });
     const [id] = await sandboxIds();
-    const box = await Sandbox.connect(id, { apiKey });
+    const box = await Sandbox.connect(id, connection);
     const deadline = Date.now() + 15000;
     while (true) {
       const probe = await box.commands
@@ -225,7 +234,7 @@ test("real E2B desktop runs commands, opens GUI apps, streams, acts, persists fi
     );
   } finally {
     const ids = await sandboxIds();
-    const killed = await Promise.all(ids.map((id) => Sandbox.kill(id, { apiKey })));
+    const killed = await Promise.all(ids.map((id) => Sandbox.kill(id, connection)));
     await db.close();
     await rm(directory, { recursive: true, force: true });
     assert.ok(killed.every(Boolean), "smoke sandbox cleanup failed");

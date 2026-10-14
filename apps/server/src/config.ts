@@ -57,6 +57,10 @@ export interface Config {
   computerProvider?: ComputerProvider;
   computerE2bTemplate?: string;
   e2bApiKey?: string;
+  /** Control-plane URL. Unset uses the SDK default, `https://api.${domain}`. */
+  e2bApiUrl?: string;
+  /** Data-plane domain. Unset uses the public E2B cluster. */
+  e2bDomain?: string;
   allowedOrigins: string[];
   trustProxy?: boolean;
 }
@@ -66,25 +70,14 @@ export type ComputerProvider = "docker" | "e2b-desktop";
 /** Pinned so live rankings do not shift when TypeSafe moves the `jev-latest` alias. */
 export const defaultJevModel = "jev-1.13.0";
 
-export const intelligenceKeyRequiredMessage =
-  "OpenMuse requires CPK_INTELLIGENCE_API_KEY. " +
-  "Run `npx copilotkit@latest login` and `npx copilotkit@latest project select`, " +
-  "then set the generated server-only key. " +
-  "See https://docs.copilotkit.ai/intelligence/connect-your-runtime";
-
 export function required(name: string, message: string, value = process.env[name]): string {
   if (!value?.trim()) throw new Error(message);
   return value.trim();
 }
 
-export function assertApiDeploymentConfig(
-  config: Config,
-): asserts config is Config & { intelligenceApiKey: string } {
-  required(
-    "CPK_INTELLIGENCE_API_KEY",
-    intelligenceKeyRequiredMessage,
-    config.intelligenceApiKey ?? "",
-  );
+/** Rich Threads uses CopilotKit Intelligence. A blank key selects the local runner. */
+export function richThreadsEnabled(config: Pick<Config, "intelligenceApiKey">): boolean {
+  return Boolean(config.intelligenceApiKey?.trim());
 }
 
 /** Accept a full worker URL, or host:port from a platform that omits the scheme. */
@@ -121,6 +114,8 @@ export function readConfig(): Config {
   if (computerProvider !== "docker" && computerProvider !== "e2b-desktop")
     throw new Error("COMPUTER_PROVIDER must be docker or e2b-desktop");
   const e2bApiKey = process.env.E2B_API_KEY?.trim();
+  const e2bApiUrl = process.env.E2B_API_URL?.trim() || undefined;
+  const e2bDomain = process.env.E2B_DOMAIN?.trim() || undefined;
   if (process.env.COMPUTER_ENABLED === "true" && computerProvider === "e2b-desktop") {
     if (!e2bApiKey)
       throw new Error("COMPUTER_PROVIDER=e2b-desktop requires a nonblank E2B_API_KEY");
@@ -149,7 +144,7 @@ export function readConfig(): Config {
     agentBackend: backend,
     agentUrl: process.env.AGENT_URL,
     agentToken: process.env.AGENT_TOKEN,
-    intelligenceApiKey: required("CPK_INTELLIGENCE_API_KEY", intelligenceKeyRequiredMessage),
+    intelligenceApiKey: process.env.CPK_INTELLIGENCE_API_KEY?.trim() || undefined,
     googleClientId: process.env.GOOGLE_CLIENT_ID,
     googleClientSecret: process.env.GOOGLE_CLIENT_SECRET,
     googleRedirectUri: `${publicUrl}/api/google/callback`,
@@ -163,6 +158,8 @@ export function readConfig(): Config {
     computerProvider,
     computerE2bTemplate: process.env.COMPUTER_E2B_TEMPLATE?.trim() || "desktop",
     e2bApiKey,
+    e2bApiUrl,
+    e2bDomain,
     allowedOrigins: (
       process.env.ALLOWED_ORIGINS ?? "http://localhost:8081,http://127.0.0.1:8081"
     ).split(","),

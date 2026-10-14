@@ -3,6 +3,7 @@ packages:
   - apps/worker
 allowBuilds:
   esbuild: true
+  better-sqlite3: true
   '@biomejs/biome': true
   '@scarf/scarf': false
   '@google/genai': false

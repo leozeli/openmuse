@@ -19,9 +19,18 @@ const idleMs = 15 * 60_000; // auto-pause after 15 idle minutes; each operation 
 const desktopIdleMs = 30 * 60_000;
 const controlMs = 10_000;
 const createMs = 60_000;
+// AGS resume often outlives the 10s control-plane timeout and then rejects kill
+// until that resume operation finishes.
+export const resumeRequestMs = 180_000;
+const killRetryWaits = [0, 1_000, 2_000, 4_000, 8_000];
+const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+const operationInProgress = (error: unknown) =>
+  /OperationInProgress/i.test(error instanceof Error ? error.message : String(error));
 const user = "user"; // the desktop template's uid 1000 account
 const display = ":0";
 export const resolution: [number, number] = [1280, 800];
+// Written by the custom-cluster session; later shells export it as DISPLAY.
+const displayFile = "/tmp/openmuse-display";
 // The SDK keeps every output byte in memory, so a command that keeps writing
 // past the capture limit is killed once it reaches this hard ceiling.
 const outputCeiling = 1024 * 1024;
@@ -59,7 +68,7 @@ export interface DesktopBox {
   /** Start a background command and return its handle. */
   run(command: string, options: DesktopRunOptions): Promise<DesktopHandle>;
   /** Run a short setup command and return its exit code. */
-  setup(command: string, asUser: string): Promise<number>;
+  setup(command: string, asUser: string, timeoutMs?: number): Promise<number>;
   writeRootFile(path: string, data: string): Promise<void>;
   /** Read a file as the desktop user. */
   readFile(path: string): Promise<Uint8Array>;
@@ -75,13 +84,27 @@ export interface DesktopDriver {
   create(template: string, metadata: Record<string, string>): Promise<string>;
   /** Filesystem-only pause: every process ends and the disk persists. */
   pause(sandboxId: string): Promise<void>;
-  /** Connect, resuming a paused sandbox, and set its idle timeout. */
-  connect(sandboxId: string, timeoutMs: number): Promise<DesktopBox>;
+  /** Delete the sandbox. The disk, including /workspace, is not kept. */
+  kill(sandboxId: string): Promise<void>;
+  /** Connect, resuming a paused sandbox, and set its idle timeout.
+   * `requestTimeoutMs` bounds the control-plane call. The default is the short
+   * control timeout; a custom-cluster resume passes a longer one. */
+  connect(sandboxId: string, timeoutMs: number, requestTimeoutMs?: number): Promise<DesktopBox>;
 }
 
 // `load` is the SDK module; tests pass a fake one.
 export function e2bDesktopDriver(config: Config, load = sdk): DesktopDriver {
-  const opts = () => ({ apiKey: config.e2bApiKey, requestTimeoutMs: controlMs });
+  // Omit unset endpoint fields so the SDK keeps its public E2B defaults.
+  const connection = (requestTimeoutMs: number) => ({
+    apiKey: config.e2bApiKey,
+    requestTimeoutMs,
+    ...(config.e2bApiUrl ? { apiUrl: config.e2bApiUrl } : {}),
+    ...(config.e2bDomain ? { domain: config.e2bDomain } : {}),
+  });
+  const opts = () => connection(controlMs);
+  // SDK env values are literal, so a custom cluster sources the detected display.
+  const shellCommand = (command: string) =>
+    config.e2bApiUrl ? `${displayExport}\n${command}` : command;
   return {
     async list(metadata) {
       const { Sandbox } = await load();
@@ -98,14 +121,27 @@ export function e2bDesktopDriver(config: Config, load = sdk): DesktopDriver {
     },
     async create(template, metadata) {
       const { Sandbox } = await load();
-      const box = await Sandbox.create(template, {
-        ...opts(),
-        requestTimeoutMs: createMs,
+      // A custom control plane (Tencent AGS) returns 500 "post-create env sync failed"
+      // when @e2b/desktop create injects DISPLAY and then starts its own Xvfb.
+      // Those images already have an X server, so create through the base SDK.
+      const custom = Boolean(config.e2bApiUrl);
+      const createOpts = {
+        ...connection(createMs),
         metadata,
         timeoutMs: idleMs,
-        resolution,
-        lifecycle: { onTimeout: { action: "pause", keepMemory: false }, autoResume: false },
-      });
+        ...(custom ? {} : { resolution }),
+        lifecycle: {
+          onTimeout: { action: "pause" as const, keepMemory: false },
+          autoResume: false,
+        },
+      };
+      const parent = Object.getPrototypeOf(Sandbox) as {
+        create?: (name: string, options: typeof createOpts) => Promise<{ sandboxId: string }>;
+      };
+      const box =
+        custom && typeof parent.create === "function"
+          ? await parent.create(template, createOpts)
+          : await Sandbox.create(template, createOpts);
       return box.sandboxId;
     },
     async pause(sandboxId) {
@@ -113,16 +149,23 @@ export function e2bDesktopDriver(config: Config, load = sdk): DesktopDriver {
       // Static pause: connect() would resume a box that is already paused.
       await Sandbox.pause(sandboxId, { ...opts(), keepMemory: false });
     },
-    async connect(sandboxId, timeoutMs) {
+    async kill(sandboxId) {
+      const { Sandbox } = await load();
+      await Sandbox.kill(sandboxId, opts());
+    },
+    async connect(sandboxId, timeoutMs, requestTimeoutMs = controlMs) {
       const { CommandExitError, Sandbox } = await load();
-      const box = await Sandbox.connect(sandboxId, { ...opts(), timeoutMs });
-      const setup = async (command: string, asUser: string) => {
+      const box = await Sandbox.connect(sandboxId, {
+        ...connection(requestTimeoutMs),
+        timeoutMs,
+      });
+      const setup = async (command: string, asUser: string, timeoutMs = 45_000) => {
         try {
           return (
-            await box.commands.run(command, {
+            await box.commands.run(shellCommand(command), {
               user: asUser,
-              envs: { DISPLAY: display },
-              timeoutMs: 45_000,
+              ...(config.e2bApiUrl ? {} : { envs: { DISPLAY: display } }),
+              timeoutMs,
             })
           ).exitCode;
         } catch (error) {
@@ -132,7 +175,17 @@ export function e2bDesktopDriver(config: Config, load = sdk): DesktopDriver {
       };
       return {
         async run(command, options) {
-          return box.commands.run(command, { ...options, background: true });
+          if (!config.e2bApiUrl) return box.commands.run(command, { ...options, background: true });
+          const envs = { ...options.envs };
+          delete envs.DISPLAY;
+          // envd before 0.3.0 rejects an explicit `stdin: false` ("it's always turned on").
+          const { stdin, ...rest } = options;
+          return box.commands.run(shellCommand(command), {
+            ...rest,
+            envs,
+            background: true,
+            ...(stdin ? { stdin: true } : {}),
+          });
         },
         setup,
         async writeRootFile(path, data) {
@@ -153,6 +206,14 @@ export function e2bDesktopDriver(config: Config, load = sdk): DesktopDriver {
           // The SDK refuses to start while any x11vnc runs.
           if (up !== 0 && (await setup(streamStop, user)) !== 0)
             throw new Error("Previous desktop stream did not stop");
+          if (config.e2bApiUrl) {
+            const read = await box.commands.run(
+              `tr -d '\\n' < ${displayFile} 2>/dev/null || true`,
+              { user, timeoutMs: 10_000 },
+            );
+            const found = read.stdout.trim();
+            if (/^:[0-9]+$/.test(found)) box.display = found;
+          }
           await box.stream.start({ requireAuth: true });
           const url = box.stream.getUrl({ authKey: box.stream.getAuthKey() });
           await setup(`printf %s ${streamTag(url)} > ${streamTagFile}`, user);
@@ -340,6 +401,42 @@ const sessionScript = [
   "for i in $(seq 100); do pgrep -x xfce4-session >/dev/null && pgrep -x xfdesktop >/dev/null && exit 0; sleep 0.3; done",
   "exit 1",
 ].join("\n");
+const xfceProbe = "pgrep -x xfce4-session >/dev/null";
+// Basic sed: capture the display argument from an Xvfb or Xorg command line.
+const xDisplaySed = "s/.*\\(Xvfb\\|Xorg\\) \\(:[0-9][0-9]*\\).*/\\2/p";
+// Reads the running X server's display into $disp. Does not exit.
+const findDisplayScript = [
+  "disp=",
+  "for pid in $(pgrep -x Xvfb || true) $(pgrep -x Xorg || true); do",
+  '  [ -n "$pid" ] || continue',
+  "  cmd=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null || true)",
+  `  d=$(printf '%s\\n' "$cmd" | sed -n '${xDisplaySed}' | head -1)`,
+  '  if [ -n "$d" ]; then disp=$d; break; fi',
+  "done",
+].join("\n");
+// Custom clusters (Tencent AGS) already run Xvfb, often on :1, and have no Xfce.
+// Reuse that display. Only boot :0 + Xfce when nothing is listening.
+const customSessionScript = [
+  findDisplayScript,
+  'if [ -n "$disp" ]; then',
+  `  printf '%s' "$disp" > ${displayFile}`,
+  "  exit 0",
+  "fi",
+  `printf '%s' ${display} > ${displayFile}`,
+  sessionScript,
+].join("\n");
+const xServerProbe = [
+  findDisplayScript,
+  'if [ -z "$disp" ]; then exit 1; fi',
+  `printf '%s' "$disp" > ${displayFile}`,
+  "exit 0",
+].join("\n");
+const desktopToolScript = [
+  "command -v scrot >/dev/null 2>&1 && command -v xdotool >/dev/null 2>&1 && exit 0",
+  "export DEBIAN_FRONTEND=noninteractive",
+  "apt-get update && apt-get install -y --no-install-recommends scrot xdotool",
+].join("\n");
+const displayExport = `export DISPLAY="$(tr -d '\\n' < ${displayFile} 2>/dev/null || printf %s :0)"`;
 
 let filesScript: Promise<string> | undefined;
 // Source runs from apps/server/src; the built server runs from the repository root.
@@ -366,6 +463,7 @@ export class E2BDesktopComputer {
   constructor(
     private readonly config: Config,
     private readonly driver: DesktopDriver = e2bDesktopDriver(config),
+    private readonly sleep: (ms: number) => Promise<void> = delay,
   ) {}
   template() {
     const template = this.config.computerE2bTemplate ?? "desktop";
@@ -397,11 +495,10 @@ export class E2BDesktopComputer {
     if (ids.length > 1) throw refuse();
     const info = await this.control(() => this.driver.info(ids[0]));
     const template = this.template();
-    const same = (a: Record<string, string>, b: Record<string, string>) =>
-      Object.keys(a).length === Object.keys(b).length &&
-      Object.entries(b).every(([key, value]) => a[key] === value);
+    // Required labels are a subset. Custom clusters (AGS) add their own keys.
+    const owns = Object.entries(labels).every(([key, value]) => info.metadata[key] === value);
     if (
-      !same(info.metadata, labels) ||
+      !owns ||
       !(
         info.name === template ||
         info.templateId === template ||
@@ -425,18 +522,91 @@ export class E2BDesktopComputer {
   private forget(id: string) {
     this.handles.delete(id);
   }
+  // Public E2B resumes a paused sandbox. A custom cluster (AGS) can reject that
+  // resume; drop the sandbox and create another. Its /workspace cannot be copied.
+  private async open(
+    id: string,
+    info: DesktopInfo | undefined,
+    labels: Record<string, string>,
+    paused: boolean,
+  ): Promise<{ id: string; box: DesktopBox }> {
+    const resume = Boolean(this.config.e2bApiUrl) && paused;
+    try {
+      return {
+        id,
+        box: await this.driver.connect(
+          id,
+          this.awake(info, idleMs),
+          resume ? resumeRequestMs : undefined,
+        ),
+      };
+    } catch (error) {
+      if (!resume || error instanceof AppError) {
+        if (error instanceof AppError) throw error;
+        await this.control(() => Promise.reject(error));
+        throw error;
+      }
+      await this.killWithRetry(id);
+      const created = await this.control(() => this.driver.create(this.template(), labels));
+      const next = await this.inspect(labels);
+      if (!next)
+        throw new AppError(
+          "E2B desktop operation failed. Check E2B_API_KEY and COMPUTER_E2B_TEMPLATE.",
+          503,
+        );
+      return {
+        id: created,
+        box: await this.control(() => this.driver.connect(created, this.awake(next, idleMs))),
+      };
+    }
+  }
+  // AGS returns 409 OperationInProgress while the timed-out resume is still running.
+  // Wait until getInfo shows a settled pause, and retry kill across that window.
+  private async killWithRetry(id: string) {
+    let last: unknown;
+    for (let attempt = 0; attempt < killRetryWaits.length; attempt++) {
+      if (killRetryWaits[attempt]) await this.sleep(killRetryWaits[attempt]);
+      let current: DesktopInfo | undefined;
+      try {
+        current = await this.driver.info(id);
+      } catch {
+        current = undefined;
+      }
+      const ags = current?.metadata["x-ags-sandbox-state"];
+      const busy = Boolean(ags) && ags !== "resume_failed" && ags !== "paused";
+      if (busy && attempt < killRetryWaits.length - 1) continue;
+      try {
+        await this.driver.kill(id);
+        return;
+      } catch (error) {
+        last = error;
+        if (!operationInProgress(error) || attempt === killRetryWaits.length - 1) {
+          if (error instanceof AppError) throw error;
+          await this.control(() => Promise.reject(error));
+          throw error;
+        }
+      }
+    }
+    await this.control(() => Promise.reject(last));
+  }
   async start(labels: Record<string, string>) {
     const existing = await this.inspect(labels);
-    const id = existing
+    let id = existing
       ? existing.sandboxId
       : await this.control(() => this.driver.create(this.template(), labels));
     const info = await this.inspect(labels); // re-check before start, including the shared deadline
     if (existing?.state !== "running") this.forget(id);
-    const cached = this.handles.get(id);
-    const box =
-      cached?.box ?? (await this.control(() => this.driver.connect(id, this.awake(info, idleMs))));
-    if (cached) await this.control(() => box.keepAlive(this.awake(info, idleMs)));
-    if (!cached) this.handles.set(id, { box });
+    const cached = this.handles.get(id)?.box;
+    let box: DesktopBox;
+    if (cached) {
+      box = cached;
+      await this.control(() => box.keepAlive(this.awake(info, idleMs)));
+    } else {
+      const opened = await this.open(id, info, labels, existing?.state === "paused");
+      id = opened.id;
+      box = opened.box;
+      this.handles.set(id, { box });
+    }
     const script = await loadFilesScript();
     await this.control(async () => {
       if (
@@ -447,7 +617,12 @@ export class E2BDesktopComputer {
       )
         throw new AppError("Computer workspace could not be prepared", 503);
       await box.writeRootFile("/opt/openmuse/files.py", script);
-      if ((await box.setup(sessionScript, user)) !== 0)
+      if (this.config.e2bApiUrl) {
+        if ((await box.setup(desktopToolScript, "root", 180_000)) !== 0)
+          throw new AppError("Computer desktop tools could not be installed", 503);
+      }
+      const session = this.config.e2bApiUrl ? customSessionScript : sessionScript;
+      if ((await box.setup(session, user)) !== 0)
         throw new AppError("Computer desktop session did not start", 503);
     });
   }
@@ -496,10 +671,12 @@ export class E2BDesktopComputer {
     this.connecting.set(id, pending);
     return pending;
   }
-  // Missing Xfce can mean startup or logout; never pause a VM based on that probe.
+  // Missing Xfce (or, on a custom cluster, any X server) can mean startup or logout;
+  // never pause a VM based on that probe.
   private async connect(id: string, info: DesktopInfo, keepMs: number): Promise<Handle> {
     const box = await this.control(() => this.driver.connect(id, this.awake(info, keepMs)));
-    if ((await this.control(() => box.setup("pgrep -x xfce4-session >/dev/null", user))) !== 0) {
+    const probe = this.config.e2bApiUrl ? xServerProbe : xfceProbe;
+    if ((await this.control(() => box.setup(probe, user))) !== 0) {
       this.forget(id);
       throw new AppError(
         "The desktop session is unavailable. Start the computer to restore it.",

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
@@ -20,6 +20,7 @@ import {
   desktopInput,
   E2BDesktopComputer,
   e2bDesktopDriver,
+  resumeRequestMs,
 } from "../apps/server/src/computer-e2b-desktop.ts";
 import { computerInstructions, computerTools } from "../apps/server/src/computer-tools.ts";
 import type { Config } from "../apps/server/src/config.ts";
@@ -57,6 +58,12 @@ function fake(
     setupEffect?: (command: string) => Promise<void> | void;
     /** Holds every stream (re)start until it resolves. */
     streamGate?: () => Promise<void>;
+    /** Thrown from connect, e.g. an AGS resume probe timeout. */
+    connectError?: (id: string) => Error | undefined;
+    /** Thrown from kill, e.g. 409 while a resume is still in progress. */
+    killError?: () => Error | undefined;
+    /** Mutates the info snapshot returned to the caller. */
+    onInfo?: (info: DesktopInfo) => void;
   } = {},
 ) {
   const boxes = new Map<string, DesktopInfo>();
@@ -67,10 +74,11 @@ function fake(
     infos: 0,
     create: [] as { template: string; metadata: Record<string, string> }[],
     pause: [] as string[],
-    connect: [] as { id: string; timeoutMs: number }[],
+    kill: [] as string[],
+    connect: [] as { id: string; timeoutMs: number; requestTimeoutMs?: number }[],
     keepAlive: [] as number[],
     run: [] as { command: string; options: DesktopRunOptions }[],
-    setup: [] as { command: string; user: string }[],
+    setup: [] as { command: string; user: string; timeoutMs?: number }[],
     files: [] as string[],
     reads: [] as string[],
     stdin: [] as Uint8Array[],
@@ -138,8 +146,8 @@ function fake(
         },
       };
     },
-    async setup(command, user) {
-      calls.setup.push({ command, user });
+    async setup(command, user, timeoutMs?: number) {
+      calls.setup.push({ command, user, timeoutMs });
       await options.setupEffect?.(command);
       if (command.includes("startxfce4")) desktops.set(id, true);
       if (command === "pgrep -x xfce4-session >/dev/null")
@@ -177,6 +185,7 @@ function fake(
     async info(id) {
       calls.infos++;
       const info = structuredClone(boxes.get(id) as DesktopInfo);
+      options.onInfo?.(info);
       options.afterInfo?.(id);
       return info;
     },
@@ -189,8 +198,17 @@ function fake(
       (boxes.get(id) as DesktopInfo).state = "paused";
       desktops.set(id, false);
     },
-    async connect(id, timeoutMs) {
-      calls.connect.push({ id, timeoutMs });
+    async kill(id) {
+      calls.kill.push(id);
+      const error = options.killError?.();
+      if (error) throw error;
+      boxes.delete(id);
+      desktops.delete(id);
+    },
+    async connect(id, timeoutMs, requestTimeoutMs?: number) {
+      calls.connect.push({ id, timeoutMs, requestTimeoutMs });
+      const error = options.connectError?.(id);
+      if (error) throw error;
       // Sandbox.connect resumes a paused box.
       (boxes.get(id) as DesktopInfo).state = "running";
       (boxes.get(id) as DesktopInfo).endAt = new Date(Date.now() + timeoutMs);
@@ -244,6 +262,8 @@ test("start creates one desktop per owner with pause-on-idle and prepares /works
   assert.ok(f.calls.setup.some((s) => s.user === "root" && s.command.includes("/workspace")));
   assert.deepEqual(f.calls.files, ["/opt/openmuse/files.py"]);
   assert.ok(f.calls.setup.some((s) => s.user === "user" && s.command.includes("startxfce4")));
+  assert.ok(!f.calls.setup.some((s) => s.command.includes("openmuse-display")));
+  assert.ok(!f.calls.setup.some((s) => s.command.includes("apt-get")));
   await computer.execute(owner, { command: "pwd" });
   assert.ok(!JSON.stringify(f.calls).includes(apiKey), "the API key never enters the sandbox");
 });
@@ -268,19 +288,15 @@ test("stop pauses without connecting, which would resume the box", async () => {
   await assert.rejects(computer.execute(owner, { command: "pwd" }), /Start the computer/);
 });
 
-test("attaching fails closed on duplicates, foreign metadata, template or lifecycle", async () => {
+test("attaching fails closed on duplicates, template or lifecycle", async () => {
   for (const boxes of [
     [{}, { sandboxId: "second" }],
     [{ name: "other-template", templateId: "other-id" }],
-    [{ metadataExtra: true }],
     [{ lifecycle: { onTimeout: "kill", autoResume: false } }],
     [{ lifecycle: { onTimeout: "pause", autoResume: true } }],
-  ] as Partial<DesktopInfo & { metadataExtra: boolean }>[][]) {
+  ] as Partial<DesktopInfo>[][]) {
     const f = fake({ boxes });
     const { computer, owner } = service(f);
-    for (const info of f.boxes.values())
-      if ((info as { metadataExtra?: boolean }).metadataExtra)
-        info.metadata = { ...info.metadata, extra: "x" };
     const snapshot = await computer.snapshot(owner);
     assert.equal(snapshot.status, "error");
     assert.match(snapshot.message ?? "", /refusing to attach/);
@@ -1238,4 +1254,487 @@ test("desktop command cannot bypass an interrupted receipt after lease validatio
   } finally {
     db.get = originalGet;
   }
+});
+
+test("E2B SDK calls include apiUrl and domain only when the cluster is configured", async () => {
+  const seen: { method: string; opts: Record<string, unknown> }[] = [];
+  class Sandbox {
+    sandboxId = "sbx-custom";
+    static list(opts: Record<string, unknown>) {
+      seen.push({ method: "list", opts });
+      return {
+        async nextItems() {
+          return [{ sandboxId: "sbx-custom" }];
+        },
+      };
+    }
+    static async getInfo(_id: string, opts: Record<string, unknown>) {
+      seen.push({ method: "getInfo", opts });
+      return {
+        sandboxId: "sbx-custom",
+        templateId: "tpl",
+        state: "paused",
+        endAt: new Date(),
+        metadata: {},
+      };
+    }
+    static async create(_template: string, opts: Record<string, unknown>) {
+      seen.push({ method: "create", opts });
+      return new Sandbox();
+    }
+    static async pause(_id: string, opts: Record<string, unknown>) {
+      seen.push({ method: "pause", opts });
+    }
+    static async connect(_id: string, opts: Record<string, unknown>) {
+      seen.push({ method: "connect", opts });
+      return new Sandbox();
+    }
+  }
+  const load = async () =>
+    ({ Sandbox, CommandExitError }) as unknown as Awaited<
+      ReturnType<NonNullable<Parameters<typeof e2bDesktopDriver>[1]>>
+    >;
+  const custom = e2bDesktopDriver(
+    { ...config, e2bApiUrl: "https://api.example.test", e2bDomain: "example.test" },
+    load,
+  );
+  assert.deepEqual(await custom.list({ owner: "a" }), ["sbx-custom"]);
+  await custom.info("sbx-custom");
+  assert.equal(await custom.create("sdt-your-template", { owner: "a" }), "sbx-custom");
+  await custom.pause("sbx-custom");
+  await custom.connect("sbx-custom", 1_000);
+  assert.deepEqual(
+    seen.map((call) => call.method),
+    ["list", "getInfo", "create", "pause", "connect"],
+  );
+  for (const call of seen) {
+    assert.equal(call.opts.apiKey, apiKey);
+    assert.equal(call.opts.apiUrl, "https://api.example.test");
+    assert.equal(call.opts.domain, "example.test");
+  }
+  assert.equal(seen.find((call) => call.method === "create")?.opts.requestTimeoutMs, 60_000);
+  assert.equal("resolution" in (seen.find((call) => call.method === "create")?.opts ?? {}), false);
+  seen.length = 0;
+  const cloud = e2bDesktopDriver(config, load);
+  await cloud.create("desktop", {});
+  const created = seen[0]?.opts;
+  assert.equal(created?.apiKey, apiKey);
+  assert.equal("apiUrl" in (created ?? {}), false);
+  assert.equal("domain" in (created ?? {}), false);
+  assert.deepEqual(created?.resolution, [1280, 800]);
+});
+
+test("ownership labels are a subset of sandbox metadata", async () => {
+  const metadata = {
+    ...labels,
+    "x-ags-id": "ags-1",
+    "x-custom-config": '{"display":"1920x1080"}',
+  };
+  const info: DesktopInfo = {
+    sandboxId: "sbx-ags",
+    templateId: "sdt-bjitb6m9",
+    name: "Lagent-example",
+    state: "running",
+    endAt: new Date(Date.now() + 60_000),
+    metadata,
+    lifecycle: { onTimeout: "pause", autoResume: false },
+  };
+  const driver: DesktopDriver = {
+    async list() {
+      return [info.sandboxId];
+    },
+    async info() {
+      return info;
+    },
+    async create() {
+      throw new Error("create");
+    },
+    async pause() {},
+    async kill() {},
+    async connect() {
+      throw new Error("connect");
+    },
+  };
+  const desktop = new E2BDesktopComputer(
+    { ...config, computerE2bTemplate: "sdt-bjitb6m9" },
+    driver,
+  );
+  assert.equal((await desktop.inspect(labels))?.sandboxId, "sbx-ags");
+  await assert.rejects(
+    desktop.inspect({ ...labels, "dev.openmuse.owner": "other-owner" }),
+    /refusing to attach/,
+  );
+  await assert.rejects(
+    desktop.inspect({ ...labels, "dev.openmuse.missing": "1" }),
+    /refusing to attach/,
+  );
+});
+
+test("a custom cluster create uses the base SDK and omits resolution", async () => {
+  const seen: { via: string; opts: Record<string, unknown> }[] = [];
+  class Base {
+    sandboxId = "sbx-base";
+    static async create(_template: string, opts: Record<string, unknown>) {
+      seen.push({ via: "base", opts });
+      return new Base();
+    }
+  }
+  class Sandbox extends Base {
+    static async create(_template: string, opts: Record<string, unknown>) {
+      seen.push({ via: "desktop", opts });
+      return new Sandbox();
+    }
+  }
+  const load = async () =>
+    ({ Sandbox, CommandExitError }) as unknown as Awaited<
+      ReturnType<NonNullable<Parameters<typeof e2bDesktopDriver>[1]>>
+    >;
+  const custom = e2bDesktopDriver(
+    { ...config, e2bApiUrl: "https://api.example.test", e2bDomain: "example.test" },
+    load,
+  );
+  assert.equal(await custom.create("sdt-bjitb6m9", { owner: "a" }), "sbx-base");
+  assert.deepEqual(
+    seen.map((call) => call.via),
+    ["base"],
+  );
+  assert.equal("resolution" in seen[0].opts, false);
+  assert.equal("envs" in seen[0].opts, false);
+  assert.equal(seen[0].opts.apiUrl, "https://api.example.test");
+  const lifecycle = seen[0].opts.lifecycle as {
+    onTimeout: { action: string };
+    autoResume: boolean;
+  };
+  assert.equal(lifecycle.onTimeout.action, "pause");
+  assert.equal(lifecycle.autoResume, false);
+  seen.length = 0;
+  await e2bDesktopDriver(config, load).create("desktop", {});
+  assert.deepEqual(
+    seen.map((call) => call.via),
+    ["desktop"],
+  );
+  assert.deepEqual(seen[0].opts.resolution, [1280, 800]);
+});
+
+test("custom cluster commands export the detected display", async () => {
+  const seen: { command: string; envs?: Record<string, string> }[] = [];
+  let displayAtStart = "";
+  class Sandbox {
+    display = ":0";
+    commands = {
+      run: async (command: string, opts: { envs?: Record<string, string> }) => {
+        seen.push({ command, envs: opts.envs });
+        return { exitCode: 0, stdout: command.startsWith("tr -d") ? ":1\n" : "", stderr: "" };
+      },
+    };
+    stream = {
+      start: async () => {
+        displayAtStart = this.display;
+      },
+      getAuthKey: () => "k",
+      getUrl: () => "https://6080.example.test/vnc.html",
+    };
+    static async connect() {
+      return new Sandbox();
+    }
+  }
+  const driver = e2bDesktopDriver(
+    { ...config, e2bApiUrl: "https://api.example.test" },
+    async () =>
+      ({ Sandbox, CommandExitError }) as unknown as Awaited<
+        ReturnType<NonNullable<Parameters<typeof e2bDesktopDriver>[1]>>
+      >,
+  );
+  const box = await driver.connect("sbx", 1_000);
+  assert.equal(await box.setup("scrot --pointer x", "user"), 0);
+  assert.match(seen[0].command, /export DISPLAY=/);
+  assert.match(seen[0].command, /openmuse-display/);
+  assert.match(seen[0].command, /scrot --pointer x/);
+  assert.equal(seen[0].envs?.DISPLAY, undefined);
+  seen.length = 0;
+  await box.run("echo hi", {
+    user: "user",
+    cwd: "/workspace",
+    envs: { DISPLAY: ":0" },
+    stdin: false,
+    timeoutMs: 1_000,
+    onStdout: () => {},
+    onStderr: () => {},
+  });
+  assert.match(seen[0].command, /export DISPLAY=/);
+  assert.match(seen[0].command, /echo hi/);
+  assert.equal(seen[0].envs?.DISPLAY, undefined);
+  assert.equal(await box.stream(), "https://6080.example.test/vnc.html");
+  assert.equal(displayAtStart, ":1");
+});
+
+test("a custom cluster session accepts a running Xvfb without xfce", {
+  skip: process.platform === "win32" && "needs /bin/bash",
+}, async () => {
+  const custom = {
+    ...config,
+    e2bApiUrl: "https://api.example.test",
+    e2bDomain: "example.test",
+    computerE2bTemplate: "sdt-bjitb6m9",
+  };
+  const f = fake({
+    boxes: [{ templateId: "sdt-bjitb6m9", name: "Lagent-example" }],
+    setupExit: (command) => (command === "pgrep -x xfce4-session >/dev/null" ? 1 : 0),
+  });
+  const owner = `owner-${++owners}`;
+  const ownerLabels = computerIdentity(custom, owner).labels;
+  for (const info of f.boxes.values()) info.metadata = { ...info.metadata, ...ownerLabels };
+  const desktop = new E2BDesktopComputer(custom, f.driver);
+  const computer = new ComputerService(db, custom, undefined, desktop);
+  assert.equal((await computer.start(owner)).status, "running");
+  assert.equal(f.calls.create.length, 0);
+  const tools = f.calls.setup.find((call) => call.command.includes("apt-get"));
+  assert.equal(tools?.user, "root");
+  assert.match(tools?.command ?? "", /scrot/);
+  assert.match(tools?.command ?? "", /xdotool/);
+  assert.equal(tools?.timeoutMs, 180_000);
+  const session = f.calls.setup.find(
+    (call) => call.user === "user" && call.command.includes("Xvfb"),
+  );
+  assert.ok(session);
+  const xfce = session.command.indexOf("startxfce4");
+  assert.ok(session.command.indexOf("exit 0") < xfce);
+  assert.ok(!f.calls.setup.some((call) => call.command === "pgrep -x xfce4-session >/dev/null"));
+  const restarted = new ComputerService(
+    db,
+    custom,
+    undefined,
+    new E2BDesktopComputer(custom, f.driver),
+  );
+  assert.match((await restarted.desktopUrl(owner)).url, /password=/);
+  const dir = await mkdtemp(join(tmpdir(), "openmuse-xvfb-"));
+  try {
+    await mkdir(join(dir, "proc/99"), { recursive: true });
+    await writeFile(join(dir, "proc/99/cmdline"), Buffer.from("Xvfb\0:1\0-screen\0"));
+    await writeFile(
+      join(dir, "pgrep"),
+      '#!/bin/bash\ncase "$*" in *-x\\ Xvfb*) echo 99; exit 0 ;; *) exit 1 ;; esac\n',
+      { mode: 0o755 },
+    );
+    const displayPath = join(dir, "display");
+    const script = session.command
+      .replaceAll("/proc/", `${dir}/proc/`)
+      .replaceAll("/tmp/openmuse-display", displayPath);
+    const ran = spawnSync("/bin/bash", ["-c", script], {
+      encoding: "utf8",
+      timeout: 5_000,
+      env: { ...process.env, PATH: `${dir}:${process.env.PATH ?? ""}` },
+    });
+    assert.equal(ran.status, 0, ran.stderr);
+    assert.equal(await readFile(displayPath, "utf8"), ":1");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a custom cluster omits stdin unless the command needs it", async () => {
+  const seen: { stdin?: boolean }[] = [];
+  class Sandbox {
+    commands = {
+      run: async (_command: string, opts: { stdin?: boolean }) => {
+        seen.push(opts);
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    };
+    static async connect() {
+      return new Sandbox();
+    }
+  }
+  const load = async () =>
+    ({ Sandbox, CommandExitError }) as unknown as Awaited<
+      ReturnType<NonNullable<Parameters<typeof e2bDesktopDriver>[1]>>
+    >;
+  const runOpts = {
+    user: "user",
+    cwd: "/workspace",
+    envs: { DISPLAY: ":0" },
+    timeoutMs: 1_000,
+    onStdout: () => {},
+    onStderr: () => {},
+  };
+  const custom = await e2bDesktopDriver(
+    { ...config, e2bApiUrl: "https://api.example.test" },
+    load,
+  ).connect("sbx", 1_000);
+  await custom.run("echo hi", { ...runOpts, stdin: false });
+  assert.equal("stdin" in seen[0], false);
+  await custom.run("cat", { ...runOpts, stdin: true });
+  assert.equal(seen[1].stdin, true);
+  seen.length = 0;
+  const cloud = await e2bDesktopDriver(config, load).connect("sbx", 1_000);
+  await cloud.run("echo hi", { ...runOpts, stdin: false });
+  assert.equal(seen[0].stdin, false);
+});
+
+test("a custom cluster replaces a paused sandbox when resume fails", async () => {
+  let probes = 0;
+  const f = fake({
+    boxes: [{ state: "paused" }],
+    connectError: () => {
+      probes++;
+      return probes === 1
+        ? new Error("400: [FailedOperation.ContainerProbe] probe timeout")
+        : undefined;
+    },
+  });
+  const custom = { ...config, e2bApiUrl: "https://api.example.test", e2bDomain: "example.test" };
+  const owner = `owner-${++owners}`;
+  const ownerLabels = computerIdentity(custom, owner).labels;
+  for (const info of f.boxes.values()) info.metadata = { ...info.metadata, ...ownerLabels };
+  const computer = new ComputerService(
+    db,
+    custom,
+    undefined,
+    new E2BDesktopComputer(custom, f.driver),
+  );
+  assert.equal((await computer.start(owner)).status, "running");
+  assert.equal(f.calls.connect[0].requestTimeoutMs, resumeRequestMs);
+  assert.equal(f.calls.connect[1].requestTimeoutMs, undefined);
+  assert.deepEqual(f.calls.kill, ["sbx-1"]);
+  assert.equal(f.calls.create.length, 1);
+  assert.equal(f.calls.connect.length, 2);
+  assert.equal(f.boxes.has("sbx-1"), true);
+  assert.equal((await computer.snapshot(owner)).status, "running");
+});
+
+test("public E2B keeps a paused sandbox when resume fails", async () => {
+  const f = fake({
+    boxes: [{ state: "paused" }],
+    connectError: () => new Error("400: [FailedOperation.ContainerProbe] probe timeout"),
+  });
+  const { computer, owner } = service(f);
+  await assert.rejects(computer.start(owner), { status: 503 });
+  assert.deepEqual(f.calls.kill, []);
+  assert.equal(f.calls.create.length, 0);
+  assert.equal(f.calls.connect[0].requestTimeoutMs, undefined);
+  assert.equal(f.boxes.get("sbx-1")?.state, "paused");
+});
+
+test("a custom cluster retries kill while resume is still in progress", async () => {
+  let kills = 0;
+  let connects = 0;
+  const sleeps: number[] = [];
+  const f = fake({
+    boxes: [{ state: "paused" }],
+    connectError: () => {
+      connects++;
+      return connects === 1
+        ? new Error("TimeoutError: The operation was aborted due to timeout")
+        : undefined;
+    },
+    killError: () => {
+      kills++;
+      return kills < 3
+        ? new Error("409 [FailedOperation.SandboxInstanceOperationInProgress]")
+        : undefined;
+    },
+  });
+  const custom = { ...config, e2bApiUrl: "https://api.example.test", e2bDomain: "example.test" };
+  const owner = `owner-${++owners}`;
+  const ownerLabels = computerIdentity(custom, owner).labels;
+  for (const info of f.boxes.values()) info.metadata = { ...info.metadata, ...ownerLabels };
+  const computer = new ComputerService(
+    db,
+    custom,
+    undefined,
+    new E2BDesktopComputer(custom, f.driver, async (ms) => {
+      sleeps.push(ms);
+    }),
+  );
+  assert.equal((await computer.start(owner)).status, "running");
+  assert.deepEqual(sleeps, [1_000, 2_000]);
+  assert.deepEqual(f.calls.kill, ["sbx-1", "sbx-1", "sbx-1"]);
+  assert.equal(f.calls.create.length, 1);
+  assert.equal(f.calls.connect[0].requestTimeoutMs, resumeRequestMs);
+});
+
+test("a custom cluster waits for resume_failed before deleting the paused sandbox", async () => {
+  let phase = "before";
+  let connects = 0;
+  const sleeps: number[] = [];
+  const f = fake({
+    boxes: [{ state: "paused" }],
+    connectError: () => {
+      connects++;
+      if (connects > 1) return undefined;
+      phase = "resuming";
+      return new Error("400: [FailedOperation.ContainerProbe] probe timeout");
+    },
+    onInfo: (info) => {
+      if (phase === "before") return;
+      info.metadata["x-ags-sandbox-state"] = phase === "resuming" ? "resuming" : "resume_failed";
+    },
+  });
+  const custom = { ...config, e2bApiUrl: "https://api.example.test" };
+  const owner = `owner-${++owners}`;
+  const ownerLabels = computerIdentity(custom, owner).labels;
+  for (const info of f.boxes.values()) info.metadata = { ...info.metadata, ...ownerLabels };
+  const computer = new ComputerService(
+    db,
+    custom,
+    undefined,
+    new E2BDesktopComputer(custom, f.driver, async (ms) => {
+      sleeps.push(ms);
+      phase = "failed";
+    }),
+  );
+  assert.equal((await computer.start(owner)).status, "running");
+  assert.deepEqual(sleeps, [1_000]);
+  assert.deepEqual(f.calls.kill, ["sbx-1"]);
+  assert.equal(f.calls.create.length, 1);
+});
+
+test("a custom cluster does not retry a kill that is not in progress", async () => {
+  const sleeps: number[] = [];
+  const f = fake({
+    boxes: [{ state: "paused" }],
+    connectError: () => new Error("TimeoutError: The operation was aborted due to timeout"),
+    killError: () => new Error("403 forbidden"),
+  });
+  const custom = { ...config, e2bApiUrl: "https://api.example.test" };
+  const owner = `owner-${++owners}`;
+  const ownerLabels = computerIdentity(custom, owner).labels;
+  for (const info of f.boxes.values()) info.metadata = { ...info.metadata, ...ownerLabels };
+  const computer = new ComputerService(
+    db,
+    custom,
+    undefined,
+    new E2BDesktopComputer(custom, f.driver, async (ms) => {
+      sleeps.push(ms);
+    }),
+  );
+  await assert.rejects(computer.start(owner), { status: 503 });
+  assert.deepEqual(sleeps, []);
+  assert.deepEqual(f.calls.kill, ["sbx-1"]);
+  assert.equal(f.calls.create.length, 0);
+  assert.equal(f.boxes.get("sbx-1")?.state, "paused");
+});
+
+test("connect uses the short control timeout unless a resume timeout is requested", async () => {
+  const seen: { requestTimeoutMs?: number; timeoutMs?: number }[] = [];
+  class Sandbox {
+    sandboxId = "sbx";
+    static async connect(_id: string, opts: { requestTimeoutMs?: number; timeoutMs?: number }) {
+      seen.push(opts);
+      return new Sandbox();
+    }
+  }
+  const load = async () =>
+    ({ Sandbox, CommandExitError }) as unknown as Awaited<
+      ReturnType<NonNullable<Parameters<typeof e2bDesktopDriver>[1]>>
+    >;
+  const custom = e2bDesktopDriver({ ...config, e2bApiUrl: "https://api.example.test" }, load);
+  await custom.connect("sbx", 1_000);
+  await custom.connect("sbx", 1_000, resumeRequestMs);
+  const cloud = e2bDesktopDriver(config, load);
+  await cloud.connect("sbx", 1_000);
+  assert.equal(seen[0].requestTimeoutMs, 10_000);
+  assert.equal(seen[1].requestTimeoutMs, resumeRequestMs);
+  assert.equal(seen[2].requestTimeoutMs, 10_000);
+  assert.equal(seen[0].timeoutMs, 1_000);
 });
