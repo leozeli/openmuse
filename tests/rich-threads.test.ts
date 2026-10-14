@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { access, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { CopilotKitIntelligence } from "@copilotkit/runtime/v2";
+import { agentRunnerPath } from "../apps/server/src/agent.ts";
 import { createApp } from "../apps/server/src/app.ts";
 import { createStore, type Store } from "../apps/server/src/db.ts";
 
@@ -197,4 +198,5 @@ test("workspace reports Rich Threads configuration without disclosing the projec
   const body = await response.text();
   assert.equal(JSON.parse(body).runtime.richThreads, true);
   assert.ok(!body.includes("test-project-key-never-sent"));
+  await assert.rejects(access(agentRunnerPath(directory)));
 });

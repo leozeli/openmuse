@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
-  assertApiDeploymentConfig,
   browserWorkerUrl,
   type Config,
   readConfig,
+  richThreadsEnabled,
   shadowedEnvKeys,
 } from "../apps/server/src/config.ts";
 
@@ -19,37 +19,31 @@ const sampleConfig: Config = {
   allowedOrigins: ["http://localhost:8081"],
 };
 
-function liveConfig(intelligenceApiKey?: string): Config {
-  return {
-    ...sampleConfig,
-    mode: "live",
-    agentBackend: "model",
-    intelligenceApiKey,
-  };
-}
-
-const missingKeyMessage =
-  "OpenMuse requires CPK_INTELLIGENCE_API_KEY. " +
-  "Run `npx copilotkit@latest login` and `npx copilotkit@latest project select`, " +
-  "then set the generated server-only key. " +
-  "See https://docs.copilotkit.ai/intelligence/connect-your-runtime";
-
-test("every API mode rejects a missing or blank Intelligence key", () => {
-  for (const mode of [sampleConfig, liveConfig()]) {
-    for (const key of [undefined, "", " \t\n"]) {
-      assert.throws(() => assertApiDeploymentConfig({ ...mode, intelligenceApiKey: key }), {
-        name: "Error",
-        message: missingKeyMessage,
-      });
+test("a missing or blank Intelligence key selects local chat", () => {
+  const keys = ["CPK_INTELLIGENCE_API_KEY", "WORKSPACE_MODE", "AGENT_BACKEND", "HOST"];
+  const old = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  try {
+    process.env.WORKSPACE_MODE = "sample";
+    process.env.AGENT_BACKEND = "sample";
+    process.env.HOST = "127.0.0.1";
+    delete process.env.CPK_INTELLIGENCE_API_KEY;
+    assert.equal(readConfig().intelligenceApiKey, undefined);
+    assert.equal(richThreadsEnabled(readConfig()), false);
+    for (const key of ["", " \t\n"]) {
+      process.env.CPK_INTELLIGENCE_API_KEY = key;
+      assert.equal(readConfig().intelligenceApiKey, undefined);
+      assert.equal(richThreadsEnabled(readConfig()), false);
     }
-  }
-});
-
-test("every API mode accepts a non-empty Intelligence key", () => {
-  for (const mode of [sampleConfig, liveConfig()]) {
-    assert.doesNotThrow(() =>
-      assertApiDeploymentConfig({ ...mode, intelligenceApiKey: "test-project-key-never-sent" }),
-    );
+    process.env.CPK_INTELLIGENCE_API_KEY = " test-project-key-never-sent ";
+    const config = readConfig();
+    assert.equal(config.intelligenceApiKey, "test-project-key-never-sent");
+    assert.equal(richThreadsEnabled(config), true);
+    assert.equal(richThreadsEnabled(sampleConfig), false);
+  } finally {
+    for (const [key, value] of Object.entries(old)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   }
 });
 

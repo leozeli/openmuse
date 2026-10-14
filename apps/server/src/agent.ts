@@ -1,4 +1,6 @@
 import "./config.ts";
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
 import { HttpAgent } from "@ag-ui/client";
 import {
   type AgentsFactory,
@@ -6,11 +8,17 @@ import {
   CopilotRuntime,
   createCopilotHonoHandler,
 } from "@copilotkit/runtime/v2";
+import { SqliteAgentRunner } from "@copilotkit/sqlite-runner";
 import type { Auth } from "./auth.ts";
 import type { Config } from "./config.ts";
 import { ConversationAgent } from "./engine/conversation.ts";
 import type { AgentService } from "./engine/service.ts";
 import { createJevAdapter, type JevAdapter } from "./jev/adapter.ts";
+
+/** File-backed CopilotKit runner used when Intelligence is not configured. */
+export function agentRunnerPath(dataDir: string) {
+  return join(dataDir, "agent-runner.sqlite");
+}
 
 export function agentConfigured(config: Config) {
   return (
@@ -29,7 +37,7 @@ export function makeRuntime(
   config: Config,
   service: AgentService,
   auth: Auth,
-  intelligence: CopilotKitIntelligence,
+  intelligence?: CopilotKitIntelligence,
 ) {
   // Built on first use, then shared so live mode reuses one TypeSafe client across requests.
   let jevAdapter: JevAdapter | undefined;
@@ -55,16 +63,32 @@ export function makeRuntime(
               sharedJevAdapter(),
             ),
   });
-  const runtime = new CopilotRuntime({
-    agents,
-    intelligence,
-    // The shared CopilotKit sink carries this tag onto existing PostHog events.
-    telemetryProperties: { accessibility_title: "OpenMuse" },
-    identifyUser: async (request) => ({
-      id: await auth.owner(request.headers.get("authorization") ?? undefined),
-      name: "OpenMuse user",
+  // The shared CopilotKit sink carries this tag onto existing PostHog events.
+  const telemetryProperties = { accessibility_title: "OpenMuse" };
+  // Intelligence and runner are mutually exclusive. A project key keeps Rich Threads;
+  // otherwise runs persist in a SQLite file under DATA_DIR.
+  if (intelligence) {
+    return createCopilotHonoHandler({
+      runtime: new CopilotRuntime({
+        agents,
+        intelligence,
+        telemetryProperties,
+        identifyUser: async (request) => ({
+          id: await auth.owner(request.headers.get("authorization") ?? undefined),
+          name: "OpenMuse user",
+        }),
+        generateThreadNames: false,
+      }),
+      basePath: "/api/copilotkit",
+    });
+  }
+  mkdirSync(config.dataDir, { recursive: true, mode: 0o700 });
+  return createCopilotHonoHandler({
+    runtime: new CopilotRuntime({
+      agents,
+      telemetryProperties,
+      runner: new SqliteAgentRunner({ dbPath: agentRunnerPath(config.dataDir) }),
     }),
-    generateThreadNames: false,
+    basePath: "/api/copilotkit",
   });
-  return createCopilotHonoHandler({ runtime, basePath: "/api/copilotkit" });
 }
