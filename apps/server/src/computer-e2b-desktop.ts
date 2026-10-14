@@ -22,6 +22,8 @@ const createMs = 60_000;
 const user = "user"; // the desktop template's uid 1000 account
 const display = ":0";
 export const resolution: [number, number] = [1280, 800];
+// Written by the custom-cluster session; later shells export it as DISPLAY.
+const displayFile = "/tmp/openmuse-display";
 // The SDK keeps every output byte in memory, so a command that keeps writing
 // past the capture limit is killed once it reaches this hard ceiling.
 const outputCeiling = 1024 * 1024;
@@ -59,7 +61,7 @@ export interface DesktopBox {
   /** Start a background command and return its handle. */
   run(command: string, options: DesktopRunOptions): Promise<DesktopHandle>;
   /** Run a short setup command and return its exit code. */
-  setup(command: string, asUser: string): Promise<number>;
+  setup(command: string, asUser: string, timeoutMs?: number): Promise<number>;
   writeRootFile(path: string, data: string): Promise<void>;
   /** Read a file as the desktop user. */
   readFile(path: string): Promise<Uint8Array>;
@@ -89,6 +91,9 @@ export function e2bDesktopDriver(config: Config, load = sdk): DesktopDriver {
     ...(config.e2bDomain ? { domain: config.e2bDomain } : {}),
   });
   const opts = () => connection(controlMs);
+  // SDK env values are literal, so a custom cluster sources the detected display.
+  const shellCommand = (command: string) =>
+    config.e2bApiUrl ? `${displayExport}\n${command}` : command;
   return {
     async list(metadata) {
       const { Sandbox } = await load();
@@ -105,13 +110,27 @@ export function e2bDesktopDriver(config: Config, load = sdk): DesktopDriver {
     },
     async create(template, metadata) {
       const { Sandbox } = await load();
-      const box = await Sandbox.create(template, {
+      // A custom control plane (Tencent AGS) returns 500 "post-create env sync failed"
+      // when @e2b/desktop create injects DISPLAY and then starts its own Xvfb.
+      // Those images already have an X server, so create through the base SDK.
+      const custom = Boolean(config.e2bApiUrl);
+      const createOpts = {
         ...connection(createMs),
         metadata,
         timeoutMs: idleMs,
-        resolution,
-        lifecycle: { onTimeout: { action: "pause", keepMemory: false }, autoResume: false },
-      });
+        ...(custom ? {} : { resolution }),
+        lifecycle: {
+          onTimeout: { action: "pause" as const, keepMemory: false },
+          autoResume: false,
+        },
+      };
+      const parent = Object.getPrototypeOf(Sandbox) as {
+        create?: (name: string, options: typeof createOpts) => Promise<{ sandboxId: string }>;
+      };
+      const box =
+        custom && typeof parent.create === "function"
+          ? await parent.create(template, createOpts)
+          : await Sandbox.create(template, createOpts);
       return box.sandboxId;
     },
     async pause(sandboxId) {
@@ -122,13 +141,13 @@ export function e2bDesktopDriver(config: Config, load = sdk): DesktopDriver {
     async connect(sandboxId, timeoutMs) {
       const { CommandExitError, Sandbox } = await load();
       const box = await Sandbox.connect(sandboxId, { ...opts(), timeoutMs });
-      const setup = async (command: string, asUser: string) => {
+      const setup = async (command: string, asUser: string, timeoutMs = 45_000) => {
         try {
           return (
-            await box.commands.run(command, {
+            await box.commands.run(shellCommand(command), {
               user: asUser,
-              envs: { DISPLAY: display },
-              timeoutMs: 45_000,
+              ...(config.e2bApiUrl ? {} : { envs: { DISPLAY: display } }),
+              timeoutMs,
             })
           ).exitCode;
         } catch (error) {
@@ -138,7 +157,10 @@ export function e2bDesktopDriver(config: Config, load = sdk): DesktopDriver {
       };
       return {
         async run(command, options) {
-          return box.commands.run(command, { ...options, background: true });
+          if (!config.e2bApiUrl) return box.commands.run(command, { ...options, background: true });
+          const envs = { ...options.envs };
+          delete envs.DISPLAY;
+          return box.commands.run(shellCommand(command), { ...options, envs, background: true });
         },
         setup,
         async writeRootFile(path, data) {
@@ -159,6 +181,14 @@ export function e2bDesktopDriver(config: Config, load = sdk): DesktopDriver {
           // The SDK refuses to start while any x11vnc runs.
           if (up !== 0 && (await setup(streamStop, user)) !== 0)
             throw new Error("Previous desktop stream did not stop");
+          if (config.e2bApiUrl) {
+            const read = await box.commands.run(
+              `tr -d '\\n' < ${displayFile} 2>/dev/null || true`,
+              { user, timeoutMs: 10_000 },
+            );
+            const found = read.stdout.trim();
+            if (/^:[0-9]+$/.test(found)) box.display = found;
+          }
           await box.stream.start({ requireAuth: true });
           const url = box.stream.getUrl({ authKey: box.stream.getAuthKey() });
           await setup(`printf %s ${streamTag(url)} > ${streamTagFile}`, user);
@@ -346,6 +376,42 @@ const sessionScript = [
   "for i in $(seq 100); do pgrep -x xfce4-session >/dev/null && pgrep -x xfdesktop >/dev/null && exit 0; sleep 0.3; done",
   "exit 1",
 ].join("\n");
+const xfceProbe = "pgrep -x xfce4-session >/dev/null";
+// Basic sed: capture the display argument from an Xvfb or Xorg command line.
+const xDisplaySed = "s/.*\\(Xvfb\\|Xorg\\) \\(:[0-9][0-9]*\\).*/\\2/p";
+// Reads the running X server's display into $disp. Does not exit.
+const findDisplayScript = [
+  "disp=",
+  "for pid in $(pgrep -x Xvfb || true) $(pgrep -x Xorg || true); do",
+  '  [ -n "$pid" ] || continue',
+  "  cmd=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null || true)",
+  `  d=$(printf '%s\\n' "$cmd" | sed -n '${xDisplaySed}' | head -1)`,
+  '  if [ -n "$d" ]; then disp=$d; break; fi',
+  "done",
+].join("\n");
+// Custom clusters (Tencent AGS) already run Xvfb, often on :1, and have no Xfce.
+// Reuse that display. Only boot :0 + Xfce when nothing is listening.
+const customSessionScript = [
+  findDisplayScript,
+  'if [ -n "$disp" ]; then',
+  `  printf '%s' "$disp" > ${displayFile}`,
+  "  exit 0",
+  "fi",
+  `printf '%s' ${display} > ${displayFile}`,
+  sessionScript,
+].join("\n");
+const xServerProbe = [
+  findDisplayScript,
+  'if [ -z "$disp" ]; then exit 1; fi',
+  `printf '%s' "$disp" > ${displayFile}`,
+  "exit 0",
+].join("\n");
+const desktopToolScript = [
+  "command -v scrot >/dev/null 2>&1 && command -v xdotool >/dev/null 2>&1 && exit 0",
+  "export DEBIAN_FRONTEND=noninteractive",
+  "apt-get update && apt-get install -y --no-install-recommends scrot xdotool",
+].join("\n");
+const displayExport = `export DISPLAY="$(tr -d '\\n' < ${displayFile} 2>/dev/null || printf %s :0)"`;
 
 let filesScript: Promise<string> | undefined;
 // Source runs from apps/server/src; the built server runs from the repository root.
@@ -403,11 +469,10 @@ export class E2BDesktopComputer {
     if (ids.length > 1) throw refuse();
     const info = await this.control(() => this.driver.info(ids[0]));
     const template = this.template();
-    const same = (a: Record<string, string>, b: Record<string, string>) =>
-      Object.keys(a).length === Object.keys(b).length &&
-      Object.entries(b).every(([key, value]) => a[key] === value);
+    // Required labels are a subset. Custom clusters (AGS) add their own keys.
+    const owns = Object.entries(labels).every(([key, value]) => info.metadata[key] === value);
     if (
-      !same(info.metadata, labels) ||
+      !owns ||
       !(
         info.name === template ||
         info.templateId === template ||
@@ -453,7 +518,12 @@ export class E2BDesktopComputer {
       )
         throw new AppError("Computer workspace could not be prepared", 503);
       await box.writeRootFile("/opt/openmuse/files.py", script);
-      if ((await box.setup(sessionScript, user)) !== 0)
+      if (this.config.e2bApiUrl) {
+        if ((await box.setup(desktopToolScript, "root", 180_000)) !== 0)
+          throw new AppError("Computer desktop tools could not be installed", 503);
+      }
+      const session = this.config.e2bApiUrl ? customSessionScript : sessionScript;
+      if ((await box.setup(session, user)) !== 0)
         throw new AppError("Computer desktop session did not start", 503);
     });
   }
@@ -502,10 +572,12 @@ export class E2BDesktopComputer {
     this.connecting.set(id, pending);
     return pending;
   }
-  // Missing Xfce can mean startup or logout; never pause a VM based on that probe.
+  // Missing Xfce (or, on a custom cluster, any X server) can mean startup or logout;
+  // never pause a VM based on that probe.
   private async connect(id: string, info: DesktopInfo, keepMs: number): Promise<Handle> {
     const box = await this.control(() => this.driver.connect(id, this.awake(info, keepMs)));
-    if ((await this.control(() => box.setup("pgrep -x xfce4-session >/dev/null", user))) !== 0) {
+    const probe = this.config.e2bApiUrl ? xServerProbe : xfceProbe;
+    if ((await this.control(() => box.setup(probe, user))) !== 0) {
       this.forget(id);
       throw new AppError(
         "The desktop session is unavailable. Start the computer to restore it.",
