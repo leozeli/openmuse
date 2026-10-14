@@ -2,6 +2,7 @@ import { useThreads } from "@copilotkit/react-native/headless";
 import {
   Archive,
   CalendarDays,
+  Download,
   FileText,
   MessageCircle,
   Monitor,
@@ -11,6 +12,7 @@ import {
 } from "lucide-react-native";
 import { createContext, type ReactNode, useContext, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Pressable, Text, View } from "react-native";
+import { downloadConversationMarkdown } from "./export-conversation";
 import { Button, colors, ErrorNotice, Field, LinkRow, Sheet, s } from "./ui";
 import { useWorkspace } from "./workspace";
 
@@ -111,12 +113,28 @@ export function ThreadsSheet({ onClose }: { onClose: () => void }) {
     select,
     start,
   } = useMuseThread();
-  const { workspace, open, navigate, refresh } = useWorkspace();
+  const { workspace, open, navigate, refresh, api } = useWorkspace();
   const threads = useThreads({ agentId: "default", enabled, includeArchived: true, limit: 20 });
   const [editing, setEditing] = useState<string>();
   const [name, setName] = useState("");
   const [error, setError] = useState("");
+  const [exportError, setExportError] = useState<{ id: string; message: string }>();
+  const [exportingId, setExportingId] = useState<string>();
   const [archived, setArchived] = useState(false);
+  async function exportSaved(id: string) {
+    setExportError(undefined);
+    setExportingId(id);
+    try {
+      await downloadConversationMarkdown(
+        api,
+        enabled ? `/api/threads/${encodeURIComponent(id)}/export` : "/api/conversation/export",
+      );
+    } catch (e) {
+      setExportError({ id, message: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setExportingId(undefined);
+    }
+  }
   async function mutate(action: () => Promise<void>) {
     setError("");
     try {
@@ -157,6 +175,16 @@ export function ThreadsSheet({ onClose }: { onClose: () => void }) {
                 onClose();
               }}
             />
+            <Button
+              small
+              icon={Download}
+              busy={exportingId === mainId}
+              disabled={!!exportingId}
+              onPress={() => void exportSaved(mainId)}
+            >
+              Download Markdown
+            </Button>
+            <ErrorNotice error={exportError?.id === mainId ? exportError.message : ""} />
             <Button
               primary
               icon={Plus}
@@ -228,7 +256,7 @@ export function ThreadsSheet({ onClose }: { onClose: () => void }) {
                   {editing === thread.id && (
                     <Field label="Conversation name" value={name} onChangeText={setName} />
                   )}
-                  <View style={[s.row, { gap: 8 }]}>
+                  <View style={[s.row, { gap: 8, flexWrap: "wrap" }]}>
                     <Button
                       small
                       disabled={threads.isMutating || (editing === thread.id && !name.trim())}
@@ -257,7 +285,17 @@ export function ThreadsSheet({ onClose }: { onClose: () => void }) {
                     >
                       {thread.archived ? "Restore" : "Archive"}
                     </Button>
+                    <Button
+                      small
+                      icon={Download}
+                      busy={exportingId === thread.id}
+                      disabled={!!exportingId}
+                      onPress={() => void exportSaved(thread.id)}
+                    >
+                      Download Markdown
+                    </Button>
                   </View>
+                  {exportError?.id === thread.id && <ErrorNotice error={exportError.message} />}
                 </View>
               ))}
             {!threads.isLoading &&
@@ -292,6 +330,16 @@ export function ThreadsSheet({ onClose }: { onClose: () => void }) {
                 onClose();
               }}
             />
+            <Button
+              small
+              icon={Download}
+              busy={exportingId === "local"}
+              disabled={!!exportingId}
+              onPress={() => void exportSaved("local")}
+            >
+              Download Markdown
+            </Button>
+            <ErrorNotice error={exportError?.id === "local" ? exportError.message : ""} />
             <Text style={s.muted}>
               Your conversation is saved in this workspace. You can manage connections in Apps.
             </Text>

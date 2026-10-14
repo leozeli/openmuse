@@ -2,10 +2,15 @@ import "./config.ts";
 import { randomUUID } from "node:crypto";
 import { MessageSchema } from "@ag-ui/core";
 import { CopilotKitIntelligence } from "@copilotkit/runtime/v2";
-import { Hono } from "hono";
+import { type Context, Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
 import { z } from "zod";
+import {
+  conversationExportFilename,
+  conversationMarkdownDisposition,
+  conversationToMarkdown,
+} from "../../../packages/domain/src/conversation-markdown.ts";
 import {
   calendarRangeSchema,
   emailDraftSchema,
@@ -242,6 +247,48 @@ export async function createApp(
     await db.put(c.get("owner"), "conversations", { id: "default", messages });
     return c.json({ ok: true });
   });
+  app.get("/api/conversation/export", async (c) => {
+    const saved = await db.get<{ messages?: unknown }>(c.get("owner"), "conversations", "default");
+    const messages = Array.isArray(saved?.messages) ? saved.messages : [];
+    const exportedAt = new Date();
+    return markdownDownload(
+      c,
+      conversationToMarkdown({
+        title: "Main chat",
+        exportedAt: exportedAt.toISOString(),
+        messages,
+      }),
+      conversationExportFilename("Main chat", exportedAt),
+    );
+  });
+  app.get("/api/threads/:threadId/export", async (c) => {
+    const threadId = c.req.param("threadId");
+    if (!intelligence || !/^[\w.@:=-]{1,128}$/.test(threadId))
+      throw new AppError("Conversation not found", 404);
+    const owner = c.get("owner");
+    const thread = await intelligenceCall(() =>
+      intelligence.getThread({ threadId, userId: owner }),
+    );
+    const history = await intelligenceCall(() =>
+      intelligence.getThreadMessages({ threadId, userId: owner }),
+    );
+    const title = thread.name?.trim() || "Untitled conversation";
+    const exportedAt = new Date();
+    const createdAt = thread.createdAt ? new Date(thread.createdAt) : exportedAt;
+    return markdownDownload(
+      c,
+      conversationToMarkdown({
+        title,
+        date: thread.createdAt,
+        exportedAt: exportedAt.toISOString(),
+        messages: Array.isArray(history.messages) ? history.messages : [],
+      }),
+      conversationExportFilename(
+        title,
+        Number.isFinite(createdAt.getTime()) ? createdAt : exportedAt,
+      ),
+    );
+  });
   app.post("/api/files", async (c) => {
     const data = await c.req.parseBody();
     const file = data.file;
@@ -355,4 +402,34 @@ export async function createApp(
     c.json({ name: "OpenMuse", app: "http://localhost:8081", health: "/api/health" }),
   );
   return { app, auth, files, actions, workspace, agent, computer };
+}
+
+function markdownDownload(
+  c: Context<{ Variables: { owner: string } }>,
+  markdown: string,
+  filename: string,
+) {
+  c.header("Content-Type", "text/markdown; charset=utf-8");
+  c.header("Content-Disposition", conversationMarkdownDisposition(filename));
+  return c.body(markdown);
+}
+
+function statusCode(error: unknown): number | undefined {
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "status" in error &&
+    typeof error.status === "number"
+  )
+    return error.status;
+  return undefined;
+}
+
+async function intelligenceCall<T>(load: () => Promise<T>): Promise<T> {
+  try {
+    return await load();
+  } catch (error) {
+    if (statusCode(error) === 404) throw new AppError("Conversation not found", 404);
+    throw new AppError("Conversation could not be exported. Try again.", 502);
+  }
 }

@@ -7,7 +7,7 @@ import {
   useRenderTool,
   useRenderToolCall,
 } from "@copilotkit/react-native/headless";
-import { ArrowDown, ArrowUp, FileText, RotateCcw, Square, X } from "lucide-react-native";
+import { ArrowDown, ArrowUp, Download, FileText, RotateCcw, Square, X } from "lucide-react-native";
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import {
   Keyboard,
@@ -21,6 +21,10 @@ import {
   View,
 } from "react-native";
 import { z } from "zod";
+import {
+  conversationExportFilename,
+  conversationToMarkdown,
+} from "../../../packages/domain/src/conversation-markdown.ts";
 import { ArtifactCard } from "./agent-ui";
 import { useAgentWorkspace } from "./agent-workspace";
 import { AssistantResponse } from "./assistant-response";
@@ -36,6 +40,11 @@ import {
   threadLocked,
 } from "./conversation-run";
 import { DesktopToolCard } from "./desktop-tool-card";
+import {
+  ConversationExportError,
+  downloadConversationMarkdown,
+  saveMarkdownFile,
+} from "./export-conversation";
 import { confirmedJevSelection, displayJevUserMessage, latestJevPanelId } from "./jev-actions";
 import { JevInteractionContext, JevToolCard } from "./jev-tool-card";
 import { MailToolCard } from "./mail-tool-card";
@@ -242,6 +251,8 @@ export function ChatScreen({
   const [awayFromLatest, setAwayFromLatest] = useState(false);
   const runLock = useRef(false);
   const [saveError, setSaveError] = useState("");
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState("");
   const [historyError, setHistoryError] = useState("");
   const [historyAttempt, setHistoryAttempt] = useState(0);
   // Loads still replaying history. A count, so an old load finishing does not end a newer one.
@@ -473,6 +484,39 @@ export function ChatScreen({
     setAttachments([]);
     setPicking(false);
   }
+  async function exportCurrent() {
+    if (!loaded || syncing || busy || agent.isRunning || exporting) return;
+    setExportError("");
+    setExporting(true);
+    const title = !richThreads || selection.id === mainId ? "Main chat" : "Side chat";
+    try {
+      if (!richThreads) await saveHistory();
+      try {
+        await downloadConversationMarkdown(
+          api,
+          richThreads
+            ? `/api/threads/${encodeURIComponent(selection.id)}/export`
+            : "/api/conversation/export",
+        );
+      } catch (error) {
+        // A side chat can be open before Intelligence has stored it.
+        if (!richThreads || !(error instanceof ConversationExportError) || error.status !== 404)
+          throw error;
+        await saveMarkdownFile(
+          conversationToMarkdown({
+            title,
+            exportedAt: new Date().toISOString(),
+            messages: agent.messages || [],
+          }),
+          conversationExportFilename(title),
+        );
+      }
+    } catch (e) {
+      setExportError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setExporting(false);
+    }
+  }
   const messages = agent.messages || [];
   const latestPanelId = latestJevPanelId(messages, threadId);
   const latestUserIndex = messages.reduce(
@@ -491,6 +535,18 @@ export function ChatScreen({
   const replying = busy || agent.isRunning;
   return (
     <View style={{ flex: 1 }}>
+      {!!exportError && <ErrorNotice error={exportError} />}
+      <View style={[s.row, { justifyContent: "flex-end", marginBottom: 8 }]}>
+        <Button
+          small
+          icon={Download}
+          busy={exporting}
+          disabled={!loaded || syncing || busy || agent.isRunning || exporting}
+          onPress={() => void exportCurrent()}
+        >
+          Download Markdown
+        </Button>
+      </View>
       <ScrollView
         ref={list}
         showsVerticalScrollIndicator={false}
