@@ -10,6 +10,10 @@ import {
   conversationExportFilename,
   conversationMarkdownDisposition,
   conversationToMarkdown,
+  conversationToolCalls,
+  type ExportToolCard,
+  type ExportToolCards,
+  taskIdFromToolResult,
 } from "../../../packages/domain/src/conversation-markdown.ts";
 import {
   calendarRangeSchema,
@@ -257,6 +261,7 @@ export async function createApp(
         title: "Main chat",
         exportedAt: exportedAt.toISOString(),
         messages,
+        toolCards: await exportToolCards(c.get("owner"), messages),
       }),
       conversationExportFilename("Main chat", exportedAt),
     );
@@ -275,13 +280,15 @@ export async function createApp(
     const title = thread.name?.trim() || "Untitled conversation";
     const exportedAt = new Date();
     const createdAt = thread.createdAt ? new Date(thread.createdAt) : exportedAt;
+    const threadMessages = Array.isArray(history.messages) ? history.messages : [];
     return markdownDownload(
       c,
       conversationToMarkdown({
         title,
         date: thread.createdAt,
         exportedAt: exportedAt.toISOString(),
-        messages: Array.isArray(history.messages) ? history.messages : [],
+        messages: threadMessages,
+        toolCards: await exportToolCards(owner, threadMessages),
       }),
       conversationExportFilename(
         title,
@@ -402,6 +409,31 @@ export async function createApp(
     c.json({ name: "OpenMuse", app: "http://localhost:8081", health: "/api/health" }),
   );
   return { app, auth, files, actions, workspace, agent, computer };
+
+  async function exportToolCards(
+    owner: string,
+    messages: readonly unknown[],
+  ): Promise<ExportToolCards> {
+    const cards: { [id: string]: ExportToolCard } = {};
+    for (const call of conversationToolCalls(messages)) {
+      const taskId = taskIdFromToolResult(call.result);
+      if (!taskId) continue;
+      try {
+        const detail = await agent.detail(owner, taskId);
+        cards[call.id] = {
+          task: detail.task,
+          browsers: detail.browsers,
+          files: [...detail.files]
+            .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+            .slice(0, 1),
+          artifacts: detail.artifacts,
+        };
+      } catch {
+        // A missing task keeps the short tool note.
+      }
+    }
+    return cards;
+  }
 }
 
 function markdownDownload(

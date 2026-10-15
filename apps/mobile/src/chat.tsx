@@ -26,9 +26,12 @@ import {
   conversationMessageFingerprint,
   conversationSegmentDownload,
   conversationSegmentFilename,
+  conversationSegmentMessages,
   conversationToMarkdown,
+  conversationToolCalls,
   preferSegmentTranscript,
   selectionToMarkdown,
+  taskIdFromToolResult,
 } from "../../../packages/domain/src/conversation-markdown.ts";
 import { ArtifactCard } from "./agent-ui";
 import { useAgentWorkspace } from "./agent-workspace";
@@ -595,7 +598,32 @@ export function ChatScreen({
         }
       }
       const transcript = preferSegmentTranscript([messages, agent.messages || [], saved], target);
-      const download = conversationSegmentDownload(transcript, target, kind, when);
+      const slice = conversationSegmentMessages(transcript, target, kind);
+      const wanted = new Set(conversationToolCalls(slice).map((call) => call.id));
+      const toolCards: Record<
+        string,
+        { task: unknown; browsers: unknown; files: unknown; artifacts: unknown }
+      > = {};
+      await Promise.all(
+        conversationToolCalls(transcript)
+          .filter((call) => wanted.has(call.id))
+          .map(async (call) => {
+            const taskId = taskIdFromToolResult(call.result);
+            if (!taskId) return;
+            try {
+              const detail = await api.request<{
+                task: unknown;
+                browsers: unknown;
+                files: unknown;
+                artifacts: unknown;
+              }>(`/api/agent/tasks/${encodeURIComponent(taskId)}`);
+              toolCards[call.id] = detail;
+            } catch {
+              // A missing task keeps the short tool note.
+            }
+          }),
+      );
+      const download = conversationSegmentDownload(transcript, target, kind, when, toolCards);
       if (!download) {
         setExportError("That message is no longer in this chat.");
         return;

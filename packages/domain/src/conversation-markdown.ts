@@ -1,3 +1,14 @@
+/** Saved task, browser, and report text shown on a tool card in the chat. */
+export interface ExportToolCard {
+  task?: unknown;
+  browsers?: unknown;
+  files?: unknown;
+  artifacts?: unknown;
+}
+
+/** Tool call id to the card the chat hydrates for that call. */
+export type ExportToolCards = Readonly<Record<string, ExportToolCard>>;
+
 /** One conversation rendered as a Markdown download. */
 export interface ConversationMarkdownInput {
   title?: string | null;
@@ -6,14 +17,17 @@ export interface ConversationMarkdownInput {
   /** Download time. Used when `date` is missing. */
   exportedAt?: string | null;
   messages: readonly unknown[];
+  /** Readable task and report cards. Absent calls stay a short tool note. */
+  toolCards?: ExportToolCards;
 }
 
 const speakers = { user: "User", assistant: "Assistant" } as const;
 
 /**
  * Render user and assistant text as labeled sections.
- * Images, tool payloads, and hidden system prompts are noted or left out
- * so the file stays readable and does not embed those parts.
+ * A saved task is written as the card in the chat: title, status, result,
+ * browser, and report fields. Other tool payloads, images, and hidden
+ * prompts stay a short note or are left out.
  */
 export function conversationToMarkdown(input: ConversationMarkdownInput): string {
   const title = oneLine(input.title) || "Conversation";
@@ -22,7 +36,7 @@ export function conversationToMarkdown(input: ConversationMarkdownInput): string
   const header = [`# ${title}`];
   if (date) header.push("", `_${date}_`);
   else if (exported) header.push("", `_Exported ${exported}_`);
-  const sections = transcriptSections(input.messages);
+  const sections = transcriptSections(input.messages, input.toolCards);
   const body = sections.length > 0 ? sections.join("\n\n") : "_No messages yet._";
   return `${header.join("\n")}\n\n${body}\n`;
 }
@@ -128,6 +142,7 @@ export function conversationSegmentDownload(
   target: ConversationSegmentTarget,
   kind: "turn" | "message",
   when = new Date(),
+  toolCards?: ExportToolCards,
 ): { markdown: string; filename: string } | null {
   const slice = conversationSegmentMessages(messages, target, kind);
   if (slice.length === 0) return null;
@@ -136,9 +151,52 @@ export function conversationSegmentDownload(
       title: segmentTitles[kind],
       exportedAt: when.toISOString(),
       messages: slice,
+      toolCards,
     }),
     filename: conversationSegmentFilename(kind, when),
   };
+}
+
+/** Assistant tool calls paired with the tool message, when the transcript has one. */
+export function conversationToolCalls(
+  messages: readonly unknown[],
+): { id: string; name: string; result: unknown }[] {
+  const calls: { id: string; name: string; result: unknown }[] = [];
+  const byId = new Map<string, { id: string; name: string; result: unknown }>();
+  for (const message of messages) {
+    if (!message || typeof message !== "object") continue;
+    const record = message as Record<string, unknown>;
+    if (record.role === "assistant") {
+      for (const call of toolCalls(record.toolCalls)) {
+        if (!call.id || byId.has(call.id)) continue;
+        const entry = { id: call.id, name: call.name, result: undefined as unknown };
+        byId.set(call.id, entry);
+        calls.push(entry);
+      }
+    } else if (record.role === "tool" && typeof record.toolCallId === "string") {
+      const entry = byId.get(record.toolCallId);
+      if (entry && entry.result === undefined) entry.result = record.content;
+    }
+  }
+  return calls;
+}
+
+/** Task id stored on a delegate_task (or similar) tool result. */
+export function taskIdFromToolResult(result: unknown): string | null {
+  let value = result;
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!text.startsWith("{") && !text.startsWith("[")) return null;
+    try {
+      value = JSON.parse(text) as unknown;
+    } catch {
+      return null;
+    }
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const id = typeof record.taskId === "string" ? record.taskId : record.id;
+  return typeof id === "string" && id.trim() ? id.trim() : null;
 }
 
 /** Stable identity of one message, used to tell two rows with the same id apart. */
@@ -255,7 +313,166 @@ function selectionText(value: string): string {
     .trim();
 }
 
-function transcriptSections(messages: readonly unknown[]): string[] {
+function renderToolCard(card: ExportToolCard | undefined): string {
+  if (!card) return "";
+  const blocks = [
+    renderTask(card.task),
+    ...listOf(card.browsers).map(renderBrowser),
+    ...newestFiles(card.files).map(renderFile),
+    ...listOf(card.artifacts).map(renderArtifact),
+  ].filter(Boolean);
+  return blocks.join("\n\n");
+}
+
+function renderTask(value: unknown): string {
+  const task = recordOf(value);
+  if (!task || typeof task.title !== "string" || typeof task.status !== "string") return "";
+  const plan = listOf(task.plan)
+    .map(recordOf)
+    .filter((step) => step !== null);
+  const done = plan.filter((step) => step.status === "succeeded").length;
+  const status = statusLabel(task.status);
+  const steps = plan.length ? ` · ${done}/${plan.length} steps` : "";
+  const next = plan.find((step) => step.status === "running" || step.status === "waiting");
+  const preview = firstText(
+    task.question,
+    task.error,
+    visibleResult(textOf(task.result)),
+    next?.title,
+  );
+  const lines = [`### ${oneLine(task.title) || "Task"}`, "", `${status}${steps}`];
+  if (preview) lines.push("", preview);
+  if (task.status === "waiting_approval") lines.push("", "Review requested");
+  else if (task.status === "waiting_input") lines.push("", "Your input is needed");
+  return lines.join("\n");
+}
+
+function renderBrowser(value: unknown): string {
+  const browser = recordOf(value);
+  if (!browser || typeof browser.url !== "string") return "";
+  const status = typeof browser.status === "string" ? browser.status : "";
+  const detail =
+    status === "closed"
+      ? "Session saved"
+      : status === "error"
+        ? "Needs attention"
+        : textOf(browser.title);
+  const lines = ["### Browser"];
+  if (detail) lines.push("", detail);
+  if (browser.url.trim()) lines.push("", browser.url.trim());
+  return lines.join("\n");
+}
+
+function renderFile(value: unknown): string {
+  const file = recordOf(value);
+  if (!file || typeof file.name !== "string" || !file.name.trim()) return "";
+  const pages = typeof file.pageCount === "number" ? file.pageCount : 0;
+  const pageLabel = pages === 1 ? "1 page" : `${pages} pages`;
+  const heading = oneLine(file.name.replace(/\.pdf$/i, "")) || "File";
+  const pdf = pages ? `PDF · ${pageLabel}` : "PDF";
+  return `### ${heading}\n\n${file.name.trim()}\n\n${pdf}`;
+}
+
+function renderArtifact(value: unknown): string {
+  const artifact = recordOf(value);
+  if (!artifact || typeof artifact.title !== "string") return "";
+  const kind = typeof artifact.kind === "string" ? statusLabel(artifact.kind) : "";
+  const summary = textOf(artifact.summary);
+  const lines = [`### ${oneLine(artifact.title) || "Result"}`];
+  if (kind) lines.push("", kind);
+  if (summary) lines.push("", summary);
+  const data = recordOf(artifact.data);
+  if (data) {
+    for (const [key, field] of Object.entries(data)) {
+      const body = renderField(field);
+      const label = fieldLabel(key);
+      if (label && body) lines.push("", `**${label}**`, "", body);
+    }
+  }
+  return lines.join("\n");
+}
+
+function renderField(value: unknown): string {
+  const data = recordOf(value);
+  if (data) {
+    return Object.entries(data)
+      .map(([name, item]) => {
+        const text = renderValue(item);
+        return text ? `${name}: ${text.replace(/\n+/g, " ")}` : "";
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+  return renderValue(value);
+}
+
+function renderValue(value: unknown): string {
+  if (typeof value === "string") return value.replace(/\r\n/g, "\n").trim().slice(0, 20000);
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) {
+    const lines = value
+      .slice(0, 100)
+      .map((item) => renderValue(item))
+      .filter(Boolean);
+    const more = value.length > 100 ? `\n\n_[${value.length - 100} more items]_` : "";
+    return `${lines.join("\n\n")}${more}`.trim();
+  }
+  const data = recordOf(value);
+  if (!data) return "";
+  return Object.entries(data)
+    .map(([name, item]) => {
+      const text = renderValue(item).replace(/\n+/g, " ");
+      return text ? `${name}: ${text}` : "";
+    })
+    .filter(Boolean)
+    .join(" · ");
+}
+
+function newestFiles(value: unknown): unknown[] {
+  return listOf(value)
+    .filter((item) => recordOf(item)?.name)
+    .sort((a, b) => textOf(recordOf(b)?.createdAt).localeCompare(textOf(recordOf(a)?.createdAt)))
+    .slice(0, 1);
+}
+
+function listOf(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function recordOf(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function textOf(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function firstText(...values: unknown[]): string {
+  for (const value of values) {
+    const text = textOf(value);
+    if (text) return visibleResult(text);
+  }
+  return "";
+}
+
+function visibleResult(value: string): string {
+  return /^Saved to (?:sample|local) sent mail(?: · .+)?$/.test(value)
+    ? "Reply saved in your local Sent mail."
+    : value;
+}
+
+function statusLabel(value: string): string {
+  const clean = value.replace(/_/g, " ").trim();
+  return clean ? `${clean.charAt(0).toUpperCase()}${clean.slice(1)}` : "";
+}
+
+function fieldLabel(key: string): string {
+  return key.replace(/_/g, " ").replace(/\s+/g, " ").trim().toUpperCase().slice(0, 80);
+}
+
+function transcriptSections(messages: readonly unknown[], toolCards?: ExportToolCards): string[] {
   const sections: string[] = [];
   const notedTools = new Set<string>();
   for (const message of messages) {
@@ -267,7 +484,8 @@ function transcriptSections(messages: readonly unknown[]): string[] {
       if (role === "assistant") {
         for (const call of toolCalls(record.toolCalls)) {
           if (call.id) notedTools.add(call.id);
-          parts.push(note(`Tool: ${call.name}`));
+          const card = call.id ? renderToolCard(toolCards?.[call.id]) : "";
+          parts.push(card || note(`Tool: ${call.name}`));
         }
       }
       if (parts.length === 0 && typeof record.encryptedValue === "string" && record.encryptedValue)

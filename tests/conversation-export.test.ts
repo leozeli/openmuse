@@ -93,6 +93,69 @@ test("local Markdown export requires a session and stays with that owner", async
       .status,
     404,
   );
+
+  await db.put("local-user", "tasks", {
+    id: "task-wecom",
+    title: "企微调研",
+    prompt: "hidden-task-prompt",
+    kind: "agent",
+    status: "succeeded",
+    plan: [
+      { id: "s1", title: "Search", status: "succeeded" },
+      { id: "s2", title: "Read", status: "succeeded" },
+      { id: "s3", title: "Write", status: "succeeded" },
+    ],
+    evidence: [],
+    input: {},
+    state: {},
+    createdAt: "2026-10-15T00:00:00.000Z",
+    updatedAt: "2026-10-15T00:00:00.000Z",
+    attempts: 1,
+    artifactIds: [],
+    result: "调研完成，报告已保存。",
+  });
+  await db.put("local-user", "agent-artifacts", {
+    id: "art-wecom",
+    taskId: "task-wecom",
+    kind: "report",
+    title: "企微调研报告",
+    summary: "Public pages describe the product.",
+    data: { EVIDENCE: ["Pricing page lists the public API."] },
+    createdAt: "2026-10-15T00:00:00.000Z",
+  });
+  await db.put("local-user", "conversations", {
+    id: "default",
+    messages: [
+      { id: "u4", role: "user", content: "你先看这来" },
+      {
+        id: "a4",
+        role: "assistant",
+        content: "那我先按公开资料做企微调研。",
+        toolCalls: [
+          {
+            id: "call-wecom",
+            type: "function",
+            function: { name: "delegate_task", arguments: '{"prompt":"secret-task"}' },
+          },
+        ],
+      },
+      { id: "t1", role: "tool", toolCallId: "call-wecom", content: '{"id":"task-wecom"}' },
+      { id: "a5", role: "assistant", content: "已创建后台调研任务，目前排队中。" },
+    ],
+  });
+  const hydrated = await localApp.request("/api/conversation/export", {
+    headers: headers(localToken),
+  });
+  assert.equal(hydrated.status, 200);
+  const report = await hydrated.text();
+  assert.match(report, /### 企微调研\n\nSucceeded · 3\/3 steps/);
+  assert.match(report, /调研完成，报告已保存。/);
+  assert.match(report, /### 企微调研报告\n\nReport\n\nPublic pages describe the product\./);
+  assert.match(report, /\*\*EVIDENCE\*\*\n\nPricing page lists the public API\./);
+  assert.match(report, /已创建后台调研任务/);
+  assert.equal(report.includes("_[Tool: delegate_task]_"), false);
+  assert.equal(report.includes("secret-task"), false);
+  assert.equal(report.includes("hidden-task-prompt"), false);
 });
 
 test("Rich Threads export loads the selected thread for the session owner", async (t) => {

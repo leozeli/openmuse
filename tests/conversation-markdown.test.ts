@@ -11,6 +11,7 @@ import {
   filenameFromContentDisposition,
   preferSegmentTranscript,
   selectionToMarkdown,
+  taskIdFromToolResult,
 } from "../packages/domain/src/conversation-markdown.ts";
 
 const image =
@@ -350,4 +351,71 @@ test("a repeated assistant id does not collapse the turn to the earlier stub", (
   const onlyStub = conversationSegmentMessages(duplicated, target, "message");
   assert.equal(onlyStub.length, 1);
   assert.equal(onlyStub[0], stub);
+});
+
+test("a delegate_task card exports the report the chat shows", () => {
+  const summary = "Public pages describe the product, the API, and the pricing.";
+  const toolCards = {
+    "call-wecom": {
+      task: {
+        title: "企微调研",
+        status: "succeeded",
+        plan: [
+          { title: "Search", status: "succeeded" },
+          { title: "Read", status: "succeeded" },
+          { title: "Write", status: "succeeded" },
+        ],
+        result: "调研完成，报告已保存。",
+      },
+      browsers: [
+        {
+          title: "WeCom docs",
+          url: "https://developer.work.weixin.qq.com/document",
+          status: "closed",
+        },
+      ],
+      artifacts: [
+        {
+          title: "企微调研报告",
+          kind: "report",
+          summary,
+          data: {
+            EVIDENCE: ["Pricing page lists the public API."],
+            PATHS: ["https://example.com/docs"],
+            PHASES: ["Collect sources", "Compare plans"],
+            SOURCES: [{ title: "Docs", url: "https://example.com/docs" }],
+          },
+        },
+      ],
+    },
+  };
+  const when = new Date("2026-10-15T03:33:00.000Z");
+  const turn = conversationSegmentDownload(wecom, { id: "a4", index: 0 }, "turn", when, toolCards);
+  assert.ok(turn);
+  assert.match(turn.markdown, /^# Turn\n/);
+  assert.match(turn.markdown, /### 企微调研\n\nSucceeded · 3\/3 steps\n\n调研完成，报告已保存。/);
+  assert.match(
+    turn.markdown,
+    /### Browser\n\nSession saved\n\nhttps:\/\/developer\.work\.weixin\.qq\.com\/document/,
+  );
+  assert.match(turn.markdown, new RegExp(`### 企微调研报告\\n\\nReport\\n\\n${summary}`));
+  assert.match(turn.markdown, /\*\*EVIDENCE\*\*\n\nPricing page lists the public API\./);
+  assert.match(turn.markdown, /\*\*PATHS\*\*/);
+  assert.match(turn.markdown, /\*\*PHASES\*\*/);
+  assert.match(turn.markdown, /\*\*SOURCES\*\*\n\ntitle: Docs · url: https:\/\/example\.com\/docs/);
+  assert.equal(turn.markdown.includes("_[Tool: delegate_task]_"), false);
+  assert.equal(turn.markdown.includes("secret-task"), false);
+  const message = conversationSegmentDownload(
+    wecom,
+    { id: "a4", index: wecom.indexOf(wecomAssistant) },
+    "message",
+    when,
+    toolCards,
+  );
+  assert.ok(message);
+  assert.match(message.markdown, /^# Message\n/);
+  assert.match(message.markdown, new RegExp(summary));
+  assert.equal(message.markdown.includes(wecomQuestion), false);
+  assert.equal(taskIdFromToolResult('{"id":"task-wecom"}'), "task-wecom");
+  assert.equal(taskIdFromToolResult("tool-secret-value"), null);
 });
