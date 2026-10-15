@@ -13,11 +13,8 @@ import {
 import { createContext, type ReactNode, useContext, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Pressable, Text, View } from "react-native";
 import { downloadConversationMarkdown } from "./export-conversation";
-import {
-  conversationExportPath,
-  conversationExportTargets,
-  type ExportTarget,
-} from "./export-targets";
+import { ExportConversationSheet } from "./export-conversation-sheet";
+import { conversationExportPath, type ExportTarget } from "./export-targets";
 import { Button, colors, ErrorNotice, Field, LinkRow, Sheet, s } from "./ui";
 import { useWorkspace } from "./workspace";
 
@@ -126,15 +123,7 @@ export function ThreadsSheet({ onClose }: { onClose: () => void }) {
   const [exportError, setExportError] = useState<{ id: string; message: string }>();
   const [exportingId, setExportingId] = useState<string>();
   const [exportPicker, setExportPicker] = useState(false);
-  const [exportArchived, setExportArchived] = useState(false);
   const [archived, setArchived] = useState(false);
-  const exportChoices = conversationExportTargets({
-    richThreads: enabled,
-    mainId,
-    openId: selection.id,
-    includeArchived: exportArchived,
-    threads: threads.threads,
-  });
   async function downloadTarget(target: ExportTarget) {
     setExportError(undefined);
     setExportingId(target.id);
@@ -426,52 +415,12 @@ export function ThreadsSheet({ onClose }: { onClose: () => void }) {
         </View>
       </Sheet>
       {exportPicker && (
-        <Sheet
-          title="Export conversation"
-          subtitle="Choose a chat to download. You do not need to open it."
+        <ExportConversationSheet
+          richThreads={enabled}
+          mainId={mainId}
+          openId={selection.id}
           onClose={() => setExportPicker(false)}
-        >
-          <View style={{ gap: 14 }}>
-            {enabled && (
-              <Button small onPress={() => setExportArchived(!exportArchived)}>
-                {exportArchived ? "Show active" : "Archived"}
-              </Button>
-            )}
-            {enabled && threads.isLoading && <ActivityIndicator color={colors.blueDark} />}
-            <ErrorNotice error={threads.error?.message} />
-            {exportChoices.map((target) => (
-              <View
-                key={target.id}
-                style={{
-                  paddingVertical: 12,
-                  borderBottomWidth: 1,
-                  borderBottomColor: colors.line,
-                  gap: 8,
-                }}
-              >
-                <Text style={s.heading}>{target.title}</Text>
-                <Text style={s.muted}>{target.detail}</Text>
-                <Button
-                  small
-                  icon={Download}
-                  label={`Download Markdown: ${target.title}`}
-                  busy={exportingId === target.id}
-                  disabled={!!exportingId}
-                  onPress={() => void downloadTarget(target)}
-                >
-                  Download Markdown
-                </Button>
-                {exportError?.id === target.id && <ErrorNotice error={exportError.message} />}
-              </View>
-            ))}
-            {exportChoices.length === 0 && <Text style={s.muted}>No conversations to export.</Text>}
-            {enabled && threads.hasMoreThreads && (
-              <Button small busy={threads.isFetchingMoreThreads} onPress={threads.fetchMoreThreads}>
-                Load more conversations
-              </Button>
-            )}
-          </View>
-        </Sheet>
+        />
       )}
     </>
   );

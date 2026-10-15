@@ -45,6 +45,7 @@ import {
   downloadConversationMarkdown,
   saveMarkdownFile,
 } from "./export-conversation";
+import { ExportConversationSheet } from "./export-conversation-sheet";
 import { confirmedJevSelection, displayJevUserMessage, latestJevPanelId } from "./jev-actions";
 import { JevInteractionContext, JevToolCard } from "./jev-tool-card";
 import { MailToolCard } from "./mail-tool-card";
@@ -253,6 +254,7 @@ export function ChatScreen({
   const [saveError, setSaveError] = useState("");
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState("");
+  const [exportPicker, setExportPicker] = useState(false);
   const [historyError, setHistoryError] = useState("");
   const [historyAttempt, setHistoryAttempt] = useState(0);
   // Loads still replaying history. A count, so an old load finishing does not end a newer one.
@@ -536,7 +538,17 @@ export function ChatScreen({
   return (
     <View style={{ flex: 1 }}>
       {!!exportError && <ErrorNotice error={exportError} />}
-      <View style={[s.row, { justifyContent: "flex-end", marginBottom: 8 }]}>
+      <View
+        style={[s.row, { justifyContent: "flex-end", flexWrap: "wrap", gap: 8, marginBottom: 8 }]}
+      >
+        <Button
+          small
+          icon={Download}
+          label="Choose a conversation to export"
+          onPress={() => setExportPicker(true)}
+        >
+          Export conversation…
+        </Button>
         <Button
           small
           icon={Download}
@@ -547,6 +559,14 @@ export function ChatScreen({
           Download Markdown
         </Button>
       </View>
+      {active && exportPicker && (
+        <ExportConversationSheet
+          richThreads={richThreads}
+          mainId={mainId}
+          openId={selection.id}
+          onClose={() => setExportPicker(false)}
+        />
+      )}
       <ScrollView
         ref={list}
         showsVerticalScrollIndicator={false}
