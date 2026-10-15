@@ -56,6 +56,111 @@ export function filenameFromContentDisposition(header: string | null): string | 
   }
 }
 
+const segmentTitles = { selection: "Selection", turn: "Turn", message: "Message" } as const;
+
+export type ConversationSegmentKind = keyof typeof segmentTitles;
+
+/** Where a right-clicked message sits in the loaded transcript. */
+export interface ConversationSegmentTarget {
+  id?: string | null;
+  /** Index in the full message list when the menu opened. Used only when `id` is empty. */
+  index: number;
+}
+
+/**
+ * Download name for one segment. The day is the UTC calendar day of `when`.
+ * `selection-YYYY-MM-DD.md`, `turn-YYYY-MM-DD.md`, or `message-YYYY-MM-DD.md`.
+ */
+export function conversationSegmentFilename(
+  kind: ConversationSegmentKind,
+  when = new Date(),
+): string {
+  return conversationExportFilename(segmentTitles[kind], when);
+}
+
+/**
+ * Messages for one dialogue turn: the user message that opened it, the reply,
+ * and any tool or other non-user messages before the next user message.
+ * Right-clicking the reply uses that same turn. A message with no user before
+ * it starts at the beginning of that leading run.
+ */
+export function conversationSegmentMessages(
+  messages: readonly unknown[],
+  target: ConversationSegmentTarget,
+  kind: "turn" | "message",
+): unknown[] {
+  const index = segmentIndex(messages, target);
+  if (index < 0) return [];
+  if (kind === "message") return [messages[index] as unknown];
+  const start = turnStart(messages, index);
+  let end = start + 1;
+  while (end < messages.length && messageRole(messages[end]) !== "user") end += 1;
+  return messages.slice(start, end);
+}
+
+/**
+ * Highlighted text in the same shape as a conversation download.
+ * A range inside one message keeps that speaker. A range across messages
+ * stays plain text, so the file does not invent speakers.
+ */
+export function selectionToMarkdown(input: {
+  text: string;
+  role?: "user" | "assistant" | null;
+  exportedAt?: string | null;
+}): string {
+  const text = selectionText(input.text);
+  const role = input.role === "user" || input.role === "assistant" ? input.role : null;
+  if (role) {
+    return conversationToMarkdown({
+      title: segmentTitles.selection,
+      exportedAt: input.exportedAt,
+      messages: text ? [{ role, content: text }] : [],
+    });
+  }
+  const stamped = conversationToMarkdown({
+    title: segmentTitles.selection,
+    exportedAt: input.exportedAt,
+    messages: text ? [{ role: "user", content: text }] : [],
+  });
+  if (!text) return stamped;
+  return stamped.replace("\n\n## User\n\n", "\n\n");
+}
+
+function segmentIndex(messages: readonly unknown[], target: ConversationSegmentTarget): number {
+  const id = typeof target.id === "string" ? target.id.trim() : "";
+  if (id) return messages.findIndex((message) => messageId(message) === id);
+  if (!Number.isInteger(target.index) || target.index < 0 || target.index >= messages.length)
+    return -1;
+  return target.index;
+}
+
+function turnStart(messages: readonly unknown[], index: number): number {
+  if (messageRole(messages[index]) === "user") return index;
+  let start = index;
+  while (start > 0 && messageRole(messages[start - 1]) !== "user") start -= 1;
+  if (start > 0 && messageRole(messages[start - 1]) === "user") return start - 1;
+  return start;
+}
+
+function messageId(message: unknown): string | null {
+  if (!message || typeof message !== "object") return null;
+  const id = (message as Record<string, unknown>).id;
+  return typeof id === "string" && id.trim() ? id : null;
+}
+
+function messageRole(message: unknown): string | null {
+  if (!message || typeof message !== "object") return null;
+  const role = (message as Record<string, unknown>).role;
+  return typeof role === "string" ? role : null;
+}
+
+function selectionText(value: string): string {
+  return value
+    .replace(/\u00a0/g, " ")
+    .replace(/\r\n/g, "\n")
+    .trim();
+}
+
 function transcriptSections(messages: readonly unknown[]): string[] {
   const sections: string[] = [];
   const notedTools = new Set<string>();

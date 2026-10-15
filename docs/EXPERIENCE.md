@@ -10,6 +10,7 @@ OpenMuse keeps conversation, ongoing work, and user control together in a shared
 - Open chats and their drafts remain mounted while navigating. Queued messages are held in the open app, not a server inbox; keep the app open until they are sent. Delegated tasks are durable server work.
 - Reading older messages should not force a scroll to the latest reply. A latest-message control returns to the live conversation.
 - **Download Markdown** above the messages saves the open chat as a `.md` file. **Export conversation…** on that same row lists Main chat and saved side chats, so you can download one without leaving the dialog. The conversation menu has the same picker, and each saved chat row can download itself.
+- Right-click a message in the open chat (long-press that message on a phone) and choose **Export as Markdown**. **Export selection** appears when text is highlighted: a highlight inside one message keeps that User or Assistant heading, and a highlight across messages is saved as the selected text. **Export this turn** saves the question and everything before the next question, including the reply you opened. **Export this message** saves only that message. The files are `selection-YYYY-MM-DD.md`, `turn-YYYY-MM-DD.md`, and `message-YYYY-MM-DD.md`, using the UTC day of the download. Those segments come from the messages already on screen.
 
 ## Transparency and control
 

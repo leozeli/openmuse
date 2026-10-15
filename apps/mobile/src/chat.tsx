@@ -23,7 +23,10 @@ import {
 import { z } from "zod";
 import {
   conversationExportFilename,
+  conversationSegmentFilename,
+  conversationSegmentMessages,
   conversationToMarkdown,
+  selectionToMarkdown,
 } from "../../../packages/domain/src/conversation-markdown.ts";
 import { ArtifactCard } from "./agent-ui";
 import { useAgentWorkspace } from "./agent-workspace";
@@ -49,7 +52,9 @@ import { ExportConversationSheet } from "./export-conversation-sheet";
 import { confirmedJevSelection, displayJevUserMessage, latestJevPanelId } from "./jev-actions";
 import { JevInteractionContext, JevToolCard } from "./jev-tool-card";
 import { MailToolCard } from "./mail-tool-card";
+import { MessageSegmentFrame, MessageSegmentMenu } from "./message-segment";
 import { SearchToolCard } from "./search-tool-card";
+import { pointFromContextMenu, readSegmentSelection, type SelectionHost } from "./segment-export";
 import { FileThreadCard, TaskThreadCard } from "./thread-artifacts";
 import { type Selection, useMuseThread } from "./threads";
 import { Button, Card, CheckRow, colors, ErrorNotice, s } from "./ui";
@@ -255,6 +260,14 @@ export function ChatScreen({
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState("");
   const [exportPicker, setExportPicker] = useState(false);
+  const [segmentMenu, setSegmentMenu] = useState<{
+    id: string;
+    index: number;
+    anchor: { x: number; y: number } | null;
+    selectionText: string | null;
+    selectionRole: "user" | "assistant" | null;
+  } | null>(null);
+  const segmentHosts = useRef(new Map<string, SelectionHost>());
   const [historyError, setHistoryError] = useState("");
   const [historyAttempt, setHistoryAttempt] = useState(0);
   // Loads still replaying history. A count, so an old load finishing does not end a newer one.
@@ -520,6 +533,65 @@ export function ChatScreen({
     }
   }
   const messages = agent.messages || [];
+  function rememberSegmentHost(id: string, role: "user" | "assistant", node: Element | null) {
+    if (!id) return;
+    if (!node) {
+      segmentHosts.current.delete(id);
+      return;
+    }
+    segmentHosts.current.set(id, { id, role, contains: (candidate) => node.contains(candidate) });
+  }
+  function openSegmentMenu(
+    message: (typeof messages)[number],
+    anchor: { x: number; y: number } | null,
+  ) {
+    const selection = readSegmentSelection([...segmentHosts.current.values()]);
+    const index = messages.indexOf(message);
+    setSegmentMenu({
+      id: typeof message.id === "string" ? message.id : "",
+      index,
+      anchor,
+      selectionText: selection?.text ?? null,
+      selectionRole: selection?.role ?? null,
+    });
+  }
+  async function downloadSegment(kind: "selection" | "turn" | "message") {
+    const menu = segmentMenu;
+    setSegmentMenu(null);
+    if (!menu) return;
+    setExportError("");
+    const when = new Date();
+    try {
+      let markdown: string;
+      if (kind === "selection") {
+        const text = menu.selectionText?.trim() ?? "";
+        if (!text) return;
+        markdown = selectionToMarkdown({
+          text,
+          role: menu.selectionRole,
+          exportedAt: when.toISOString(),
+        });
+      } else {
+        const slice = conversationSegmentMessages(
+          messages,
+          { id: menu.id, index: menu.index },
+          kind,
+        );
+        if (slice.length === 0) {
+          setExportError("That message is no longer in this chat.");
+          return;
+        }
+        markdown = conversationToMarkdown({
+          title: kind === "turn" ? "Turn" : "Message",
+          exportedAt: when.toISOString(),
+          messages: slice,
+        });
+      }
+      await saveMarkdownFile(markdown, conversationSegmentFilename(kind, when));
+    } catch (error) {
+      setExportError(error instanceof Error ? error.message : String(error));
+    }
+  }
   const latestPanelId = latestJevPanelId(messages, threadId);
   const latestUserIndex = messages.reduce(
     (last, message, index) => (message.role === "user" ? index : last),
@@ -565,6 +637,16 @@ export function ChatScreen({
           mainId={mainId}
           openId={selection.id}
           onClose={() => setExportPicker(false)}
+        />
+      )}
+      {active && segmentMenu && (
+        <MessageSegmentMenu
+          anchor={segmentMenu.anchor}
+          hasSelection={!!segmentMenu.selectionText}
+          onExportSelection={() => void downloadSegment("selection")}
+          onExportTurn={() => void downloadSegment("turn")}
+          onExportMessage={() => void downloadSegment("message")}
+          onClose={() => setSegmentMenu(null)}
         />
       )}
       <ScrollView
@@ -648,9 +730,24 @@ export function ChatScreen({
                   : message.content
                 : "";
             const toolCalls = "toolCalls" in message ? message.toolCalls || [] : [];
+            const messageId = typeof message.id === "string" ? message.id : "";
             return (
-              <View
+              <MessageSegmentFrame
                 key={message.id}
+                hint={
+                  user
+                    ? "Right-click or long-press to export this message"
+                    : "Right-click or long-press to export this reply"
+                }
+                onHost={(node) =>
+                  rememberSegmentHost(
+                    messageId || `index-${messages.indexOf(message)}`,
+                    user ? "user" : "assistant",
+                    node,
+                  )
+                }
+                onContextMenu={(event) => openSegmentMenu(message, pointFromContextMenu(event))}
+                onLongPress={() => openSegmentMenu(message, null)}
                 style={{
                   alignSelf: user ? "flex-end" : "flex-start",
                   maxWidth: user ? "85%" : "95%",
@@ -722,7 +819,7 @@ export function ChatScreen({
                     })}
                   </BrowserRunContext>
                 </JevInteractionContext.Provider>
-              </View>
+              </MessageSegmentFrame>
             );
           })
         )}
