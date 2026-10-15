@@ -121,6 +121,7 @@ export function Button({
   busy,
   small,
   danger,
+  label,
   style,
 }: {
   children: ReactNode;
@@ -131,12 +132,14 @@ export function Button({
   busy?: boolean;
   small?: boolean;
   danger?: boolean;
+  label?: string;
   style?: ViewStyle;
 }) {
   const color = danger ? colors.danger : colors.text;
   return (
     <Pressable
       accessibilityRole="button"
+      accessibilityLabel={label}
       disabled={disabled || busy}
       accessibilityState={{ disabled: !!(disabled || busy), busy: !!busy }}
       onPress={onPress}

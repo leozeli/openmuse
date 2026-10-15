@@ -7,7 +7,7 @@ import {
   useRenderTool,
   useRenderToolCall,
 } from "@copilotkit/react-native/headless";
-import { ArrowDown, ArrowUp, FileText, RotateCcw, Square, X } from "lucide-react-native";
+import { ArrowDown, ArrowUp, Download, FileText, RotateCcw, Square, X } from "lucide-react-native";
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import {
   Keyboard,
@@ -21,6 +21,18 @@ import {
   View,
 } from "react-native";
 import { z } from "zod";
+import {
+  conversationExportFilename,
+  conversationMessageFingerprint,
+  conversationSegmentDownload,
+  conversationSegmentFilename,
+  conversationSegmentMessages,
+  conversationToMarkdown,
+  conversationToolCalls,
+  preferSegmentTranscript,
+  selectionToMarkdown,
+  taskIdFromToolResult,
+} from "../../../packages/domain/src/conversation-markdown.ts";
 import { ArtifactCard } from "./agent-ui";
 import { useAgentWorkspace } from "./agent-workspace";
 import { AssistantResponse } from "./assistant-response";
@@ -36,10 +48,18 @@ import {
   threadLocked,
 } from "./conversation-run";
 import { DesktopToolCard } from "./desktop-tool-card";
+import {
+  ConversationExportError,
+  downloadConversationMarkdown,
+  saveMarkdownFile,
+} from "./export-conversation";
+import { ExportConversationSheet } from "./export-conversation-sheet";
 import { confirmedJevSelection, displayJevUserMessage, latestJevPanelId } from "./jev-actions";
 import { JevInteractionContext, JevToolCard } from "./jev-tool-card";
 import { MailToolCard } from "./mail-tool-card";
+import { MessageSegmentFrame, MessageSegmentMenu } from "./message-segment";
 import { SearchToolCard } from "./search-tool-card";
+import { pointFromContextMenu, readSegmentSelection, type SelectionHost } from "./segment-export";
 import { FileThreadCard, TaskThreadCard } from "./thread-artifacts";
 import { type Selection, useMuseThread } from "./threads";
 import { Button, Card, CheckRow, colors, ErrorNotice, s } from "./ui";
@@ -242,6 +262,19 @@ export function ChatScreen({
   const [awayFromLatest, setAwayFromLatest] = useState(false);
   const runLock = useRef(false);
   const [saveError, setSaveError] = useState("");
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState("");
+  const [exportPicker, setExportPicker] = useState(false);
+  const [segmentMenu, setSegmentMenu] = useState<{
+    id: string;
+    index: number;
+    fingerprint: string;
+    anchor: { x: number; y: number } | null;
+    selectionText: string | null;
+    selectionRole: "user" | "assistant" | null;
+  } | null>(null);
+  const segmentDownloadLock = useRef(false);
+  const segmentHosts = useRef(new Map<string, SelectionHost>());
   const [historyError, setHistoryError] = useState("");
   const [historyAttempt, setHistoryAttempt] = useState(0);
   // Loads still replaying history. A count, so an old load finishing does not end a newer one.
@@ -473,7 +506,135 @@ export function ChatScreen({
     setAttachments([]);
     setPicking(false);
   }
+  async function exportCurrent() {
+    if (!loaded || syncing || busy || agent.isRunning || exporting) return;
+    setExportError("");
+    setExporting(true);
+    const title = !richThreads || selection.id === mainId ? "Main chat" : "Side chat";
+    try {
+      if (!richThreads) await saveHistory();
+      try {
+        await downloadConversationMarkdown(
+          api,
+          richThreads
+            ? `/api/threads/${encodeURIComponent(selection.id)}/export`
+            : "/api/conversation/export",
+        );
+      } catch (error) {
+        // A side chat can be open before Intelligence has stored it.
+        if (!richThreads || !(error instanceof ConversationExportError) || error.status !== 404)
+          throw error;
+        await saveMarkdownFile(
+          conversationToMarkdown({
+            title,
+            exportedAt: new Date().toISOString(),
+            messages: agent.messages || [],
+          }),
+          conversationExportFilename(title),
+        );
+      }
+    } catch (e) {
+      setExportError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setExporting(false);
+    }
+  }
   const messages = agent.messages || [];
+  function rememberSegmentHost(id: string, role: "user" | "assistant", node: Element | null) {
+    if (!id) return;
+    if (!node) {
+      segmentHosts.current.delete(id);
+      return;
+    }
+    segmentHosts.current.set(id, { id, role, contains: (candidate) => node.contains(candidate) });
+  }
+  function openSegmentMenu(
+    message: (typeof messages)[number],
+    anchor: { x: number; y: number } | null,
+  ) {
+    const selection = readSegmentSelection([...segmentHosts.current.values()]);
+    const index = messages.indexOf(message);
+    setSegmentMenu({
+      id: typeof message.id === "string" ? message.id : "",
+      index,
+      fingerprint: conversationMessageFingerprint(message),
+      anchor,
+      selectionText: selection?.text ?? null,
+      selectionRole: selection?.role ?? null,
+    });
+  }
+  async function downloadSegment(kind: "selection" | "turn" | "message") {
+    if (segmentDownloadLock.current) return;
+    const menu = segmentMenu;
+    if (!menu) return;
+    segmentDownloadLock.current = true;
+    setSegmentMenu(null);
+    setExportError("");
+    const when = new Date();
+    try {
+      if (kind === "selection") {
+        const text = menu.selectionText?.trim() ?? "";
+        if (!text) return;
+        await saveMarkdownFile(
+          selectionToMarkdown({
+            text,
+            role: menu.selectionRole,
+            exportedAt: when.toISOString(),
+          }),
+          conversationSegmentFilename(kind, when),
+        );
+        return;
+      }
+      const target = { id: menu.id, index: menu.index, fingerprint: menu.fingerprint };
+      let saved: unknown[] = [];
+      // Local mode persists the transcript the full download reads. The in-memory
+      // list can be a shorter copy after a tool call.
+      if (!richThreads) {
+        try {
+          const body = await api.request<{ messages?: unknown }>("/api/conversation");
+          if (Array.isArray(body.messages)) saved = body.messages;
+        } catch {
+          saved = [];
+        }
+      }
+      const transcript = preferSegmentTranscript([messages, agent.messages || [], saved], target);
+      const slice = conversationSegmentMessages(transcript, target, kind);
+      const wanted = new Set(conversationToolCalls(slice).map((call) => call.id));
+      const toolCards: Record<
+        string,
+        { task: unknown; browsers: unknown; files: unknown; artifacts: unknown }
+      > = {};
+      await Promise.all(
+        conversationToolCalls(transcript)
+          .filter((call) => wanted.has(call.id))
+          .map(async (call) => {
+            const taskId = taskIdFromToolResult(call.result);
+            if (!taskId) return;
+            try {
+              const detail = await api.request<{
+                task: unknown;
+                browsers: unknown;
+                files: unknown;
+                artifacts: unknown;
+              }>(`/api/agent/tasks/${encodeURIComponent(taskId)}`);
+              toolCards[call.id] = detail;
+            } catch {
+              // A missing task keeps the short tool note.
+            }
+          }),
+      );
+      const download = conversationSegmentDownload(transcript, target, kind, when, toolCards);
+      if (!download) {
+        setExportError("That message is no longer in this chat.");
+        return;
+      }
+      await saveMarkdownFile(download.markdown, download.filename);
+    } catch (error) {
+      setExportError(error instanceof Error ? error.message : String(error));
+    } finally {
+      segmentDownloadLock.current = false;
+    }
+  }
   const latestPanelId = latestJevPanelId(messages, threadId);
   const latestUserIndex = messages.reduce(
     (last, message, index) => (message.role === "user" ? index : last),
@@ -491,6 +652,46 @@ export function ChatScreen({
   const replying = busy || agent.isRunning;
   return (
     <View style={{ flex: 1 }}>
+      {!!exportError && <ErrorNotice error={exportError} />}
+      <View
+        style={[s.row, { justifyContent: "flex-end", flexWrap: "wrap", gap: 8, marginBottom: 8 }]}
+      >
+        <Button
+          small
+          icon={Download}
+          label="Choose a conversation to export"
+          onPress={() => setExportPicker(true)}
+        >
+          Export conversation…
+        </Button>
+        <Button
+          small
+          icon={Download}
+          busy={exporting}
+          disabled={!loaded || syncing || busy || agent.isRunning || exporting}
+          onPress={() => void exportCurrent()}
+        >
+          Download Markdown
+        </Button>
+      </View>
+      {active && exportPicker && (
+        <ExportConversationSheet
+          richThreads={richThreads}
+          mainId={mainId}
+          openId={selection.id}
+          onClose={() => setExportPicker(false)}
+        />
+      )}
+      {active && segmentMenu && (
+        <MessageSegmentMenu
+          anchor={segmentMenu.anchor}
+          hasSelection={!!segmentMenu.selectionText}
+          onExportSelection={() => void downloadSegment("selection")}
+          onExportTurn={() => void downloadSegment("turn")}
+          onExportMessage={() => void downloadSegment("message")}
+          onClose={() => setSegmentMenu(null)}
+        />
+      )}
       <ScrollView
         ref={list}
         showsVerticalScrollIndicator={false}
@@ -572,9 +773,24 @@ export function ChatScreen({
                   : message.content
                 : "";
             const toolCalls = "toolCalls" in message ? message.toolCalls || [] : [];
+            const messageId = typeof message.id === "string" ? message.id : "";
             return (
-              <View
+              <MessageSegmentFrame
                 key={message.id}
+                hint={
+                  user
+                    ? "Right-click or long-press to export this message"
+                    : "Right-click or long-press to export this reply"
+                }
+                onHost={(node) =>
+                  rememberSegmentHost(
+                    messageId || `index-${messages.indexOf(message)}`,
+                    user ? "user" : "assistant",
+                    node,
+                  )
+                }
+                onContextMenu={(event) => openSegmentMenu(message, pointFromContextMenu(event))}
+                onLongPress={() => openSegmentMenu(message, null)}
                 style={{
                   alignSelf: user ? "flex-end" : "flex-start",
                   maxWidth: user ? "85%" : "95%",
@@ -646,7 +862,7 @@ export function ChatScreen({
                     })}
                   </BrowserRunContext>
                 </JevInteractionContext.Provider>
-              </View>
+              </MessageSegmentFrame>
             );
           })
         )}
