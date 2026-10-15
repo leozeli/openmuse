@@ -36,20 +36,36 @@ export async function downloadConversationMarkdown(api: MuseApi, path: string): 
   await saveMarkdownFile(body, filename);
 }
 
+// One download at a time. Revoking a blob URL in the same turn as the next
+// click lets the browser write one body into both filenames.
+let webDownloadQueue = Promise.resolve();
+
 export async function saveMarkdownFile(markdown: string, filename: string): Promise<void> {
   const safeName = filename.replace(/[^A-Za-z0-9._-]/g, "") || "conversation.md";
   if (Platform.OS === "web") {
-    const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = safeName;
-    anchor.rel = "noopener";
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    URL.revokeObjectURL(url);
-    return;
+    const run = webDownloadQueue.then(
+      () =>
+        new Promise<void>((resolve) => {
+          const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
+          const url = URL.createObjectURL(blob);
+          const anchor = document.createElement("a");
+          anchor.href = url;
+          anchor.download = safeName;
+          anchor.rel = "noopener";
+          document.body.appendChild(anchor);
+          anchor.click();
+          anchor.remove();
+          // Resolve quickly so the next export can start, but keep this blob alive
+          // until the browser has read it. Revoking in the same turn swaps bodies.
+          setTimeout(resolve, 50);
+          setTimeout(() => URL.revokeObjectURL(url), 1500);
+        }),
+    );
+    webDownloadQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
   }
   if (!FileSystem.cacheDirectory) throw new Error("Saving is not available on this device.");
   const target = `${FileSystem.cacheDirectory}${safeName}`;

@@ -1,4 +1,4 @@
-import { type ComponentProps, type ReactNode, useEffect } from "react";
+import { type ComponentProps, type ReactNode, useEffect, useRef } from "react";
 import {
   Modal,
   Platform,
@@ -71,6 +71,7 @@ export function MessageSegmentMenu({
 }) {
   const { width, height } = useWindowDimensions();
   const insets = useSafeAreaInsets();
+  const openedAt = useRef(Date.now());
   const menuWidth = 280;
   const menuHeight = hasSelection ? 248 : 196;
   let left = anchor ? anchor.x : Math.max(12, (width - menuWidth) / 2);
@@ -78,9 +79,14 @@ export function MessageSegmentMenu({
   if (anchor) {
     if (left + menuWidth > width - 8) left = Math.max(8, width - menuWidth - 8);
     if (left < 8) left = 8;
+    // Keep the menu off the pointer so the click that opened it does not land on an action.
     if (top !== undefined && top + menuHeight > height - 8)
-      top = Math.max(8, anchor.y - menuHeight);
+      top = Math.max(8, anchor.y - menuHeight - 12);
     if (top !== undefined && top < 8) top = 8;
+  }
+  function acceptPress(action: () => void) {
+    if (Date.now() - openedAt.current < 250) return;
+    action();
   }
   useEffect(() => {
     if (Platform.OS !== "web" || typeof window === "undefined") return;
@@ -95,8 +101,8 @@ export function MessageSegmentMenu({
       <View style={{ flex: 1 }}>
         <Pressable
           accessibilityLabel="Dismiss export menu"
-          onPress={onClose}
-          style={{ position: "absolute", top: 0, right: 0, bottom: 0, left: 0 }}
+          onPress={() => acceptPress(onClose)}
+          style={{ position: "absolute", top: 0, right: 0, bottom: 0, left: 0, zIndex: 1 }}
         />
         <View
           accessibilityRole="menu"
@@ -107,6 +113,7 @@ export function MessageSegmentMenu({
             top,
             bottom: top === undefined ? Math.max(insets.bottom, 12) : undefined,
             width: menuWidth,
+            zIndex: 2,
             backgroundColor: colors.card,
             borderRadius: 18,
             borderWidth: 1,
@@ -122,18 +129,18 @@ export function MessageSegmentMenu({
             <MenuItem
               label="Export selection"
               detail="Highlighted text"
-              onPress={onExportSelection}
+              onPress={() => acceptPress(onExportSelection)}
             />
           )}
           <MenuItem
             label="Export this turn"
             detail="From the question through the reply"
-            onPress={onExportTurn}
+            onPress={() => acceptPress(onExportTurn)}
           />
           <MenuItem
             label="Export this message"
             detail="Only this message"
-            onPress={onExportMessage}
+            onPress={() => acceptPress(onExportMessage)}
           />
         </View>
       </View>

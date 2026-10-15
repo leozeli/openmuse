@@ -3,10 +3,13 @@ import { test } from "node:test";
 import {
   conversationExportFilename,
   conversationMarkdownDisposition,
+  conversationMessageFingerprint,
+  conversationSegmentDownload,
   conversationSegmentFilename,
   conversationSegmentMessages,
   conversationToMarkdown,
   filenameFromContentDisposition,
+  preferSegmentTranscript,
   selectionToMarkdown,
 } from "../packages/domain/src/conversation-markdown.ts";
 
@@ -270,4 +273,81 @@ Saturday plan
     conversationSegmentFilename("message", new Date("2026-03-01T00:00:00.000Z")),
     "message-2026-03-01.md",
   );
+});
+
+const delegateCall = {
+  id: "call-wecom",
+  type: "function",
+  function: { name: "delegate_task", arguments: '{"prompt":"secret-task"}' },
+};
+const wecomQuestion = "你先看这来";
+const wecomReply = "那我先按公开资料做企微调研。";
+const wecomFollowUp = "已创建后台调研任务，目前排队中。";
+const wecomAssistant = {
+  id: "a4",
+  role: "assistant",
+  content: wecomReply,
+  toolCalls: [delegateCall],
+};
+const wecom = [
+  { id: "u3", role: "user", content: "上一问" },
+  { id: "a3", role: "assistant", content: "上一答" },
+  { id: "u4", role: "user", content: wecomQuestion },
+  wecomAssistant,
+  { id: "t1", role: "tool", toolCallId: "call-wecom", content: '{"id":"task-secret"}' },
+  { id: "a5", role: "assistant", content: wecomFollowUp },
+  { id: "u5", role: "user", content: "下一问" },
+];
+
+test("a multi-assistant tool turn keeps the question and the follow-up", () => {
+  const when = new Date("2026-10-15T03:33:00.000Z");
+  for (const id of ["a4", "a5"]) {
+    const turn = conversationSegmentDownload(wecom, { id, index: 0 }, "turn", when);
+    assert.ok(turn);
+    assert.equal(turn.filename, "turn-2026-10-15.md");
+    assert.match(turn.markdown, /^# Turn\n/);
+    assert.match(turn.markdown, new RegExp(`## User\\n\\n${wecomQuestion}`));
+    assert.match(turn.markdown, new RegExp(`## Assistant\\n\\n${wecomReply}`));
+    assert.match(turn.markdown, /_\[Tool: delegate_task\]_/);
+    assert.match(turn.markdown, new RegExp(`## Assistant\\n\\n${wecomFollowUp}`));
+    assert.equal(turn.markdown.includes("上一问"), false);
+    assert.equal(turn.markdown.includes("下一问"), false);
+    assert.equal(turn.markdown.includes("secret-task"), false);
+    assert.equal(turn.markdown.includes("task-secret"), false);
+  }
+  const message = conversationSegmentDownload(
+    wecom,
+    { id: "a4", index: wecom.indexOf(wecomAssistant) },
+    "message",
+    when,
+  );
+  assert.ok(message);
+  assert.equal(message.filename, "message-2026-10-15.md");
+  assert.match(message.markdown, /^# Message\n/);
+  assert.equal(message.markdown.includes(wecomQuestion), false);
+  assert.equal(message.markdown.includes(wecomFollowUp), false);
+  assert.notEqual(
+    message.markdown,
+    conversationSegmentDownload(wecom, { id: "a4", index: 0 }, "turn", when)?.markdown,
+  );
+});
+
+test("a repeated assistant id does not collapse the turn to the earlier stub", () => {
+  const stub = { ...wecomAssistant };
+  const duplicated = [stub, ...wecom];
+  const target = {
+    id: "a4",
+    index: 0,
+    fingerprint: conversationMessageFingerprint(stub),
+  };
+  const chosen = preferSegmentTranscript([[stub], duplicated], target);
+  assert.equal(chosen, duplicated);
+  const turn = conversationSegmentMessages(duplicated, target, "turn");
+  assert.deepEqual(
+    turn.map((message) => (message as { id: string }).id),
+    ["u4", "a4", "t1", "a5"],
+  );
+  const onlyStub = conversationSegmentMessages(duplicated, target, "message");
+  assert.equal(onlyStub.length, 1);
+  assert.equal(onlyStub[0], stub);
 });

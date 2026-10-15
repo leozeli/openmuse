@@ -23,9 +23,11 @@ import {
 import { z } from "zod";
 import {
   conversationExportFilename,
+  conversationMessageFingerprint,
+  conversationSegmentDownload,
   conversationSegmentFilename,
-  conversationSegmentMessages,
   conversationToMarkdown,
+  preferSegmentTranscript,
   selectionToMarkdown,
 } from "../../../packages/domain/src/conversation-markdown.ts";
 import { ArtifactCard } from "./agent-ui";
@@ -263,10 +265,12 @@ export function ChatScreen({
   const [segmentMenu, setSegmentMenu] = useState<{
     id: string;
     index: number;
+    fingerprint: string;
     anchor: { x: number; y: number } | null;
     selectionText: string | null;
     selectionRole: "user" | "assistant" | null;
   } | null>(null);
+  const segmentDownloadLock = useRef(false);
   const segmentHosts = useRef(new Map<string, SelectionHost>());
   const [historyError, setHistoryError] = useState("");
   const [historyAttempt, setHistoryAttempt] = useState(0);
@@ -550,46 +554,57 @@ export function ChatScreen({
     setSegmentMenu({
       id: typeof message.id === "string" ? message.id : "",
       index,
+      fingerprint: conversationMessageFingerprint(message),
       anchor,
       selectionText: selection?.text ?? null,
       selectionRole: selection?.role ?? null,
     });
   }
   async function downloadSegment(kind: "selection" | "turn" | "message") {
+    if (segmentDownloadLock.current) return;
     const menu = segmentMenu;
-    setSegmentMenu(null);
     if (!menu) return;
+    segmentDownloadLock.current = true;
+    setSegmentMenu(null);
     setExportError("");
     const when = new Date();
     try {
-      let markdown: string;
       if (kind === "selection") {
         const text = menu.selectionText?.trim() ?? "";
         if (!text) return;
-        markdown = selectionToMarkdown({
-          text,
-          role: menu.selectionRole,
-          exportedAt: when.toISOString(),
-        });
-      } else {
-        const slice = conversationSegmentMessages(
-          messages,
-          { id: menu.id, index: menu.index },
-          kind,
+        await saveMarkdownFile(
+          selectionToMarkdown({
+            text,
+            role: menu.selectionRole,
+            exportedAt: when.toISOString(),
+          }),
+          conversationSegmentFilename(kind, when),
         );
-        if (slice.length === 0) {
-          setExportError("That message is no longer in this chat.");
-          return;
-        }
-        markdown = conversationToMarkdown({
-          title: kind === "turn" ? "Turn" : "Message",
-          exportedAt: when.toISOString(),
-          messages: slice,
-        });
+        return;
       }
-      await saveMarkdownFile(markdown, conversationSegmentFilename(kind, when));
+      const target = { id: menu.id, index: menu.index, fingerprint: menu.fingerprint };
+      let saved: unknown[] = [];
+      // Local mode persists the transcript the full download reads. The in-memory
+      // list can be a shorter copy after a tool call.
+      if (!richThreads) {
+        try {
+          const body = await api.request<{ messages?: unknown }>("/api/conversation");
+          if (Array.isArray(body.messages)) saved = body.messages;
+        } catch {
+          saved = [];
+        }
+      }
+      const transcript = preferSegmentTranscript([messages, agent.messages || [], saved], target);
+      const download = conversationSegmentDownload(transcript, target, kind, when);
+      if (!download) {
+        setExportError("That message is no longer in this chat.");
+        return;
+      }
+      await saveMarkdownFile(download.markdown, download.filename);
     } catch (error) {
       setExportError(error instanceof Error ? error.message : String(error));
+    } finally {
+      segmentDownloadLock.current = false;
     }
   }
   const latestPanelId = latestJevPanelId(messages, threadId);

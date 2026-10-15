@@ -63,8 +63,13 @@ export type ConversationSegmentKind = keyof typeof segmentTitles;
 /** Where a right-clicked message sits in the loaded transcript. */
 export interface ConversationSegmentTarget {
   id?: string | null;
-  /** Index in the full message list when the menu opened. Used only when `id` is empty. */
+  /**
+   * Index in the transcript that was on screen when the menu opened.
+   * Used when `id` is empty, and to prefer that row among duplicate ids.
+   */
   index: number;
+  /** Role and text of the clicked row, so a repeated id does not select a different copy. */
+  fingerprint?: string | null;
 }
 
 /**
@@ -89,13 +94,61 @@ export function conversationSegmentMessages(
   target: ConversationSegmentTarget,
   kind: "turn" | "message",
 ): unknown[] {
-  const index = segmentIndex(messages, target);
+  const index = segmentIndex(messages, target, kind);
   if (index < 0) return [];
   if (kind === "message") return [messages[index] as unknown];
-  const start = turnStart(messages, index);
-  let end = start + 1;
-  while (end < messages.length && messageRole(messages[end]) !== "user") end += 1;
+  const { start, end } = turnBounds(messages, index);
   return messages.slice(start, end);
+}
+
+/**
+ * Pick the transcript whose turn around this message is the most complete.
+ * A short in-memory list loses to the saved conversation when that copy
+ * still has the question and the follow-up replies.
+ */
+export function preferSegmentTranscript(
+  transcripts: readonly (readonly unknown[])[],
+  target: ConversationSegmentTarget,
+): readonly unknown[] {
+  let best: readonly unknown[] = [];
+  let bestSize = -1;
+  for (const transcript of transcripts) {
+    const size = conversationSegmentMessages(transcript, target, "turn").length;
+    if (size > bestSize) {
+      best = transcript;
+      bestSize = size;
+    }
+  }
+  return best;
+}
+
+/** Markdown and filename for one segment. The heading and the file name use the same kind. */
+export function conversationSegmentDownload(
+  messages: readonly unknown[],
+  target: ConversationSegmentTarget,
+  kind: "turn" | "message",
+  when = new Date(),
+): { markdown: string; filename: string } | null {
+  const slice = conversationSegmentMessages(messages, target, kind);
+  if (slice.length === 0) return null;
+  return {
+    markdown: conversationToMarkdown({
+      title: segmentTitles[kind],
+      exportedAt: when.toISOString(),
+      messages: slice,
+    }),
+    filename: conversationSegmentFilename(kind, when),
+  };
+}
+
+/** Stable identity of one message, used to tell two rows with the same id apart. */
+export function conversationMessageFingerprint(message: unknown): string {
+  if (!message || typeof message !== "object") return "";
+  const record = message as Record<string, unknown>;
+  const role = typeof record.role === "string" ? record.role : "";
+  const text = typeof record.content === "string" ? record.content.slice(0, 80) : "";
+  const tools = Array.isArray(record.toolCalls) ? record.toolCalls.length : 0;
+  return `${role}:${tools}:${text}`;
 }
 
 /**
@@ -126,12 +179,53 @@ export function selectionToMarkdown(input: {
   return stamped.replace("\n\n## User\n\n", "\n\n");
 }
 
-function segmentIndex(messages: readonly unknown[], target: ConversationSegmentTarget): number {
+function segmentIndex(
+  messages: readonly unknown[],
+  target: ConversationSegmentTarget,
+  kind: "turn" | "message",
+): number {
   const id = typeof target.id === "string" ? target.id.trim() : "";
-  if (id) return messages.findIndex((message) => messageId(message) === id);
+  const fingerprint = typeof target.fingerprint === "string" ? target.fingerprint : "";
+  const matches: number[] = [];
+  if (id) {
+    messages.forEach((message, index) => {
+      if (messageId(message) === id) matches.push(index);
+    });
+  }
+  const sameText = fingerprint
+    ? matches.filter((index) => conversationMessageFingerprint(messages[index]) === fingerprint)
+    : [];
+  const candidates = sameText.length > 0 ? sameText : matches;
+  if (candidates.length === 1) return candidates[0] as number;
+  if (candidates.length > 1) {
+    const clicked = candidates.includes(target.index) ? target.index : -1;
+    // Export this message stays on the row that was opened.
+    if (kind === "message" && clicked >= 0) return clicked;
+    // A repeated id must not stick to an earlier stub and drop the rest of the turn.
+    let best = candidates[0] as number;
+    for (const index of candidates) {
+      const span = turnSpan(messages, index);
+      const bestSpan = turnSpan(messages, best);
+      if (span > bestSpan || (span === bestSpan && index === clicked)) best = index;
+    }
+    return best;
+  }
+  if (id) return -1;
   if (!Number.isInteger(target.index) || target.index < 0 || target.index >= messages.length)
     return -1;
   return target.index;
+}
+
+function turnBounds(messages: readonly unknown[], index: number): { start: number; end: number } {
+  const start = turnStart(messages, index);
+  let end = start + 1;
+  while (end < messages.length && messageRole(messages[end]) !== "user") end += 1;
+  return { start, end };
+}
+
+function turnSpan(messages: readonly unknown[], index: number): number {
+  const { start, end } = turnBounds(messages, index);
+  return end - start;
 }
 
 function turnStart(messages: readonly unknown[], index: number): number {
